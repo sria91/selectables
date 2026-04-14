@@ -1,0 +1,24 @@
+[package]
+name = "selectables"
+authors = ["Srikanth Anantharam <sria91@gmail.com>"]
+version = "0.1.0"
+edition = "2024"
+description = "Lock-free channels with a unified select! macro for recv and send arms"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sria91/selectables"
+documentation = "https://docs.rs/selectables"
+keywords = ["channels", "select", "concurrency", "lock-free", "broadcast"]
+categories = ["algorithms", "concurrency", "data-structures"]
+
+[dependencies]
+arc-swap = "1"
+crossbeam-queue = "0.3"
+log = { version = "0.4", optional = true }
+
+[dev-dependencies]
+minimal_logger = "0.1"
+
+[features]
+debug-logs = ["log"]
+default = []
