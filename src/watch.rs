@@ -272,8 +272,14 @@ impl<T> Clone for Receiver<T> {
             value: Arc::clone(&self.value),
             recv_waiters: Arc::clone(&self.recv_waiters),
             select_waiters: Arc::clone(&self.select_waiters),
-            wait_version: Arc::clone(&self.wait_version),
-            wait_armed: Arc::clone(&self.wait_armed),
+            // Each clone gets its own independent cursor so that one receiver
+            // consuming a notification does not suppress it for sibling clones.
+            wait_version: Arc::new(AtomicUsize::new(
+                self.wait_version.load(Ordering::SeqCst),
+            )),
+            wait_armed: Arc::new(AtomicBool::new(
+                self.wait_armed.load(Ordering::SeqCst),
+            )),
             receiver_count: Arc::clone(&self.receiver_count),
         }
     }
@@ -416,11 +422,12 @@ impl<T> Receiver<T> {
 
     /// Complete the select operation.
     pub fn complete_changed(&self) -> Result<usize, RecvError> {
-        let baseline = if self.wait_armed.load(Ordering::SeqCst) {
-            self.wait_version.load(Ordering::SeqCst)
-        } else {
-            self.snapshot_wait_version()?
-        };
+        // Use the stored wait_version as the baseline directly.
+        // The select! macro calls complete() on the *original* receiver (not the
+        // armed clone stored in Select), so we cannot rely on wait_armed being
+        // set. Using wait_version (which defaults to 0) as the baseline means we
+        // return immediately if any version > baseline already exists.
+        let baseline = self.wait_version.load(Ordering::SeqCst);
         self.await_change_from(baseline)
     }
 }
@@ -494,17 +501,32 @@ mod tests {
     }
 
     #[test]
-    fn select_state_is_shared_across_clones() {
+    fn clones_have_independent_cursors() {
         let (tx, rx) = channel::<i32>();
-        tx.send(1).unwrap();
+        tx.send(1).unwrap(); // version = 1
 
         let clone = rx.clone();
-        assert!(!clone.is_ready());
 
-        tx.send(2).unwrap();
+        // is_ready() arms each receiver at the current version (establishes
+        // baseline); returns false because no new change has occurred since
+        // arming. The two cursors are independent.
+        assert!(!rx.is_ready());    // arms rx at version 1
+        assert!(!clone.is_ready()); // arms clone at version 1, independently
 
+        tx.send(2).unwrap(); // version = 2
+
+        // Both see version 2 > their cursor of 1.
         assert!(rx.is_ready());
+        assert!(clone.is_ready());
+
+        // Completing via rx advances only rx's cursor, not clone's.
         assert_eq!(rx.complete_changed(), Ok(2));
+        assert!(!rx.is_ready());   // rx cursor now at 2
+        assert!(clone.is_ready()); // clone cursor still at 1 < 2
+
+        tx.send(3).unwrap();
+        assert!(rx.is_ready());
+        assert_eq!(rx.complete_changed(), Ok(3));
     }
 
     #[test]
