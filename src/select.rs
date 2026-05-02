@@ -62,26 +62,21 @@
 
 use std::{
     sync::Arc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering::*},
     thread,
     time::{Duration, Instant},
 };
 
-use crate::{SelectableReceiver, SelectableSender, internals::UNSELECTED};
+use crate::{SelectableReceiver, SelectableSender, waiter::UNSELECTED};
 
 // ════════════════════════════════════════════════════════════════════════════
 // Select
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Trait for select operations.
-trait SelectOpTrait {
-    fn is_ready(&self) -> bool;
-    fn register(&self, case_id: usize, selected: Arc<AtomicUsize>);
-    fn abort(&self, selected: &Arc<AtomicUsize>);
-}
-
-/// Trait for send-side select operations.
-trait SendOpTrait {
+/// Unified trait for both recv and send select arms.
+///
+/// Both arm kinds require the same three methods, so a single trait serves both.
+trait ArmOpTrait {
     fn is_ready(&self) -> bool;
     fn register(&self, case_id: usize, selected: Arc<AtomicUsize>);
     fn abort(&self, selected: &Arc<AtomicUsize>);
@@ -89,39 +84,36 @@ trait SendOpTrait {
 
 /// Unified operation: either a recv or a send arm.
 enum AnyOp {
-    Recv(Box<dyn SelectOpTrait + Send + Sync>),
-    Send(Box<dyn SendOpTrait + Send + Sync>),
+    Recv(Box<dyn ArmOpTrait + Send + Sync>),
+    Send(Box<dyn ArmOpTrait + Send + Sync>),
 }
 
 impl AnyOp {
     fn is_ready(&self) -> bool {
         match self {
-            AnyOp::Recv(op) => op.is_ready(),
-            AnyOp::Send(op) => op.is_ready(),
+            AnyOp::Recv(op) | AnyOp::Send(op) => op.is_ready(),
         }
     }
 
     fn register(&self, case_id: usize, selected: Arc<AtomicUsize>) {
         match self {
-            AnyOp::Recv(op) => op.register(case_id, selected),
-            AnyOp::Send(op) => op.register(case_id, selected),
+            AnyOp::Recv(op) | AnyOp::Send(op) => op.register(case_id, selected),
         }
     }
 
     fn abort(&self, selected: &Arc<AtomicUsize>) {
         match self {
-            AnyOp::Recv(op) => op.abort(selected),
-            AnyOp::Send(op) => op.abort(selected),
+            AnyOp::Recv(op) | AnyOp::Send(op) => op.abort(selected),
         }
     }
 }
 
-/// Concrete implementation of SelectOpTrait for recv arms.
+/// `ArmOpTrait` implementation for recv arms.
 struct SelectOp<R: SelectableReceiver> {
     receiver: R,
 }
 
-impl<R: SelectableReceiver + Send + Sync + 'static> SelectOpTrait for SelectOp<R>
+impl<R: SelectableReceiver + Send + Sync + 'static> ArmOpTrait for SelectOp<R>
 where
     R::Output: Send,
 {
@@ -138,12 +130,12 @@ where
     }
 }
 
-/// Concrete implementation of SendOpTrait for send arms.
+/// `ArmOpTrait` implementation for send arms.
 struct SendOp<S: SelectableSender> {
     sender: S,
 }
 
-impl<S: SelectableSender + Send + Sync + 'static> SendOpTrait for SendOp<S>
+impl<S: SelectableSender + Send + Sync + 'static> ArmOpTrait for SendOp<S>
 where
     S::Input: Send,
 {
@@ -204,11 +196,19 @@ impl Select {
 
     /// Block until one arm is ready.
     pub fn select(&mut self) -> SelectedOperation {
-        self.select_impl(None)
-            .expect("select() called with zero arms")
+        self.select_impl(None).unwrap_or_else(|| {
+            unreachable!("select_impl panics on empty ops before returning None")
+        })
     }
 
     /// Return `None` immediately if nothing is ready (non-blocking).
+    ///
+    /// Implemented as `select_impl(Some(Instant::now()))`.  Because `Instant::now()`
+    /// is sampled *before* the try-phase runs, a very brief delay between the
+    /// sample and the deadline check inside `select_impl` can cause the try-phase
+    /// to fall through to waiter registration before the deadline fires.  In
+    /// practice this is harmless (registration is immediately aborted and `None`
+    /// is returned), but callers should not rely on this being strictly zero-cost.
     pub fn try_select(&mut self) -> Option<SelectedOperation> {
         self.select_impl(Some(Instant::now()))
     }
@@ -224,12 +224,12 @@ impl Select {
     }
 
     fn select_impl(&mut self, deadline: Option<Instant>) -> Option<SelectedOperation> {
-        assert!(!self.ops.is_empty(), "Select with no registered operations");
+        assert!(!self.ops.is_empty(), "Select::select() called with no registered arms");
         let n = self.ops.len();
 
         loop {
             log_debug!("select::select_impl: arms={}, deadline={:?}", n, deadline);
-            let start = FAIRNESS_CTR.fetch_add(1, Ordering::Relaxed) % n;
+            let start = FAIRNESS_CTR.fetch_add(1, Relaxed) % n;
             log_debug!("select::try phase: start_index={}", start);
             for i in 0..n {
                 let idx = (start + i) % n;
@@ -256,13 +256,13 @@ impl Select {
                 if op.is_ready() {
                     log_debug!("select::recheck: arm {} became ready during register", idx);
                     selected
-                        .compare_exchange(UNSELECTED, idx, Ordering::SeqCst, Ordering::SeqCst)
+                        .compare_exchange(UNSELECTED, idx, SeqCst, SeqCst)
                         .ok();
                     break;
                 }
             }
 
-            if selected.load(Ordering::SeqCst) == UNSELECTED {
+            if selected.load(SeqCst) == UNSELECTED {
                 match deadline {
                     None => {
                         log_debug!("select::park phase: parking indefinitely");
@@ -280,7 +280,7 @@ impl Select {
                 op.abort(&selected);
             }
 
-            let won = selected.load(Ordering::SeqCst);
+            let won = selected.load(SeqCst);
             if won != UNSELECTED {
                 log_debug!("select::winner: idx={}", won);
                 return Some(SelectedOperation { index: won });
@@ -367,21 +367,6 @@ impl Default for Select {
 /// ## Variable binding
 /// Each arm binds `msg` (or any `ident`) to `Result<T, RecvError>`.
 /// Inspect it as usual: `msg.unwrap()`, `match msg { Ok(v) => … }`, etc.
-///
-/// ## Timeout via `after()`
-/// You can also use `after(dur)` as a regular recv arm instead of `default(…)`:
-///
-/// ```
-/// use std::time::Duration;
-/// use selectables::{bounded_mpmc, unbounded_mpmc, select, SelectableReceiver};
-///
-/// let (_tx, rx) = unbounded_mpmc::channel::<i32>(); // nothing will ever be sent
-/// let timeout = bounded_mpmc::after(Duration::from_millis(100));
-/// select! {
-///     recv(rx)      -> msg => { println!("got: {:?}", msg); },
-///     recv(timeout) -> _   => { println!("timed out"); },
-/// }
-/// ```
 #[macro_export]
 macro_rules! select {
     // ── Blocking: N recv arms, no default ────────────────────────────────
@@ -390,7 +375,7 @@ macro_rules! select {
         $( __sel.recv($rx.clone()); )+
         let __oper = __sel.select();
         let mut __n = 0usize;
-        $crate::select!(@arm __oper __n $(, recv($rx) -> $var => $body)+)
+        $crate::select!(@arm_new __oper __n $(, recv($rx) -> $var => $body)+)
     }};
 
     // ── Non-blocking: N recv arms + instant default ───────────────────────
@@ -399,7 +384,7 @@ macro_rules! select {
         $( __sel.recv($rx.clone()); )+
         if let Some(__oper) = __sel.try_select() {
             let mut __n = 0usize;
-            $crate::select!(@arm __oper __n $(, recv($rx) -> $var => $body)+)
+            $crate::select!(@arm_new __oper __n $(, recv($rx) -> $var => $body)+)
         } else {
             $def
         }
@@ -411,7 +396,7 @@ macro_rules! select {
         $( __sel.recv($rx.clone()); )+
         if let Some(__oper) = __sel.select_timeout($dur) {
             let mut __n = 0usize;
-            $crate::select!(@arm __oper __n $(, recv($rx) -> $var => $body)+)
+            $crate::select!(@arm_new __oper __n $(, recv($rx) -> $var => $body)+)
         } else {
             $def
         }
@@ -580,33 +565,6 @@ macro_rules! select {
         }
     }};
 
-    // ── Internal: dispatch, multiple arms remain (legacy recv-only path) ──
-    (@arm $oper:ident $n:ident,
-        $kind:ident ($rx:expr) -> $var:pat => $body:expr,
-        $($rest:tt)+
-    ) => {{
-        let __i = $n; $n += 1;
-        if $oper.index == __i {
-            let $var = $crate::SelectableReceiver::complete(&($rx));
-            $body
-        } else {
-            $crate::select!(@arm $oper $n, $($rest)+)
-        }
-    }};
-
-    // ── Internal: dispatch, last arm (legacy recv-only path) ──────────────
-    (@arm $oper:ident $n:ident, $kind:ident ($rx:expr) -> $var:pat => $body:expr) => {{
-        let __i = $n;
-        if $oper.index == __i {
-            let $var = $crate::SelectableReceiver::complete(&($rx));
-            $body
-        } else {
-            unreachable!(
-                "select!: winning index {} >= arm count {}",
-                $oper.index, __i + 1
-            )
-        }
-    }};
 }
 
 #[cfg(test)]
@@ -655,7 +613,7 @@ mod tests {
         });
 
         select! {
-            recv(watch_rx) -> version => assert_eq!(version, Ok(1)),
+            recv(watch_rx) -> res => assert_eq!(res, Ok(())),
             recv(rx_msg) -> _msg => panic!("message arm should lose this race"),
         }
     }
@@ -728,11 +686,10 @@ mod tests {
     fn test_send_arm_disconnect_bounded() {
         let (tx, rx) = bounded_mpmc::channel::<i32>(4);
         drop(rx);
-        // is_ready() returns true when receiver_count == 0; send fires.
-        // bounded_mpmc::send() pushes to ring buffer and returns Ok even with
-        // no receivers (message is simply never consumed).
+        // bounded_mpmc::send() now returns Err when all receivers are dropped,
+        // consistent with all other channel variants.
         select! {
-            send(tx, 5) -> res => assert!(res.is_ok()),
+            send(tx, 5) -> res => assert!(res.is_err()),
         }
     }
 
@@ -741,9 +698,9 @@ mod tests {
     fn test_send_arm_disconnect_unbounded() {
         let (tx, rx) = unbounded_mpmc::channel::<i32>();
         drop(rx);
-        // unbounded_mpmc::send() always pushes and returns Ok.
+        // send() returns Err when all receivers have been dropped.
         select! {
-            send(tx, 5) -> res => assert!(res.is_ok()),
+            send(tx, 5) -> res => assert!(res.is_err()),
         }
     }
 
@@ -837,7 +794,7 @@ mod tests {
     #[test]
     fn blocking_select_waits_for_message() {
         let (tx, rx) = unbounded_mpmc::channel::<i32>();
-        let never_rx = bounded_mpmc::never::<i32>();
+        let (_idle_tx, idle_rx) = bounded_mpmc::channel::<i32>(1); // alive but never sends
 
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
@@ -846,7 +803,7 @@ mod tests {
 
         select! {
             recv(rx) -> msg => assert_eq!(msg.unwrap(), 123),
-            recv(never_rx) -> _ => panic!("never arm must not fire"),
+            recv(idle_rx) -> _ => panic!("idle arm must not fire"),
         }
     }
 
@@ -872,17 +829,12 @@ mod tests {
     /// select! with a timeout arm correctly returns after the deadline.
     #[test]
     fn timeout_select_returns_within_deadline() {
-        // Channel with no sender so it stays permanently empty (never ready).
-        let (tx, rx) = unbounded_mpmc::channel::<i32>();
-        drop(tx); // drop sender so recv would return Disconnected — but we need Empty
-        // Use a never() channel which is permanently alive-but-empty.
-        let never_rx = bounded_mpmc::never::<i32>();
+        let (_idle_tx, idle_rx) = bounded_mpmc::channel::<i32>(1); // alive but never sends
         let before = std::time::Instant::now();
         select! {
-            recv(never_rx) -> _ => panic!("should not fire"),
+            recv(idle_rx) -> _ => panic!("should not fire"),
             default(Duration::from_millis(40)) => {}
         }
-        let _ = rx; // silence unused warning
         let elapsed = before.elapsed();
         assert!(elapsed >= Duration::from_millis(40));
         assert!(elapsed < Duration::from_millis(500));

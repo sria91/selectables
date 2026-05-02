@@ -21,9 +21,10 @@
 //!
 //! # Single receiver
 //!
-//! - `Receiver` is NOT cloneable (single consumer ownership)
+//! - `Receiver` is also cloneable; the "SC" in MPSC describes typical single-consumer
+//!   usage, but cloning is supported (e.g. for `select!` arms)
 //! - `Sender` is fully cloneable
-//! - If you need multiple consumers, use `unbounded_mpmc` instead
+//! - If you need multiple independent consumers, use `unbounded_mpmc` instead
 //!
 //! # Example
 //!
@@ -54,9 +55,10 @@ use crossbeam_queue::SegQueue;
 use crate::{
     error::{RecvError, SendError, TryRecvError},
     waiter::{
-        RecvWaiter, RecvWaiterGuard, RecvWaiterList, SelectWaiter, UNSELECTED,
+        RecvWaiterList, SelectWaiter,
         abort_select_waiters, drain_select_waiters, new_recv_waiter_list, push_select_waiter,
-        wake_all_recv_waiters, wake_all_unselected_recv_waiters, wake_select_all, wake_select_one,
+        register_plain_recv_waiter, wake_all_recv_waiters, wake_all_unselected_recv_waiters,
+        wake_select_all, wake_select_one,
     },
 };
 
@@ -99,7 +101,17 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 pub struct Sender<T>(pub(crate) Arc<Chan<T>>);
 
 impl<T> Sender<T> {
+    /// Returns `true` if all [`Receiver`] handles have been dropped.
+    pub fn is_closed(&self) -> bool {
+        self.0.receiver_count.load(Acquire) == 0
+    }
+
     /// Send never blocks on unbounded channel.
+    ///
+    /// **Note:** `Ok(())` confirms the value was enqueued but does not guarantee
+    /// a receiver is still live — the last receiver may drop concurrently after
+    /// the disconnected check and before the push.  The value will be freed
+    /// when the channel tears down.
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
         if self.0.receiver_count.load(Acquire) == 0 {
             return Err(SendError(msg));
@@ -124,7 +136,7 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let prev = self.0.sender_count.fetch_sub(1, AcqRel);
         if prev == 1 {
-            wake_all_recv_waiters(&self.0.recv_waiters, UNSELECTED);
+            wake_all_recv_waiters(&self.0.recv_waiters);
             wake_select_all(&self.0.select_waiters);
         }
     }
@@ -165,9 +177,8 @@ impl<T> Receiver<T> {
     }
 
     pub fn recv(&self) -> Result<T, RecvError> {
-        let marker = Arc::new(AtomicUsize::new(UNSELECTED));
         loop {
-            // Fast path.
+            // --- fast path (lock-free) ---
             if let Some(v) = self.0.queue.pop() {
                 return Ok(v);
             }
@@ -175,21 +186,14 @@ impl<T> Receiver<T> {
                 return Err(RecvError::Disconnected);
             }
 
-            // Slow path: lock-free registration.
-            let waiter = RecvWaiter::new(usize::MAX, Arc::clone(&marker));
-            let _guard = RecvWaiterGuard::register(waiter, &self.0.recv_waiters);
+            // --- slow path: register waiter, re-check, park ---
+            let _guard = register_plain_recv_waiter(&self.0.recv_waiters);
 
-            // Re-check after push
+            // Re-check after registration to close the lost-wakeup window.
             if let Some(v) = self.0.queue.pop() {
                 return Ok(v);
             }
             if self.0.sender_count.load(Acquire) == 0 {
-                return Err(RecvError::Disconnected);
-            }
-            if marker.load(Acquire) != UNSELECTED {
-                if let Some(v) = self.0.queue.pop() {
-                    return Ok(v);
-                }
                 return Err(RecvError::Disconnected);
             }
 
@@ -210,39 +214,15 @@ impl<T> Receiver<T> {
         abort_select_waiters(&self.0.select_waiters, selected);
     }
 
-    pub fn complete_recv(&self) -> Result<T, RecvError> {
-        match self.try_recv() {
-            Ok(msg) => Ok(msg),
-            Err(TryRecvError::Empty) => Err(RecvError::Disconnected),
-            Err(TryRecvError::Disconnected) => Err(RecvError::Disconnected),
-            Err(TryRecvError::Lagged { .. }) => unreachable!("unbounded_mpsc cannot lag"),
-        }
+    /// Called by `select!` after this arm wins. Calls `recv()` so that if a
+    /// concurrent consumer raced ahead, we wait for the next message instead
+    /// of returning a spurious `Disconnected`.
+    pub(crate) fn complete_recv(&self) -> Result<T, RecvError> {
+        self.recv()
     }
 }
 
-impl<T> crate::SelectableReceiver for Receiver<T> {
-    type Output = T;
-
-    fn is_ready(&self) -> bool {
-        self.is_ready()
-    }
-
-    fn register_select(
-        &self,
-        case_id: usize,
-        selected: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        self.register_select(case_id, selected)
-    }
-
-    fn abort_select(&self, selected: &std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        self.abort_select(selected)
-    }
-
-    fn complete(&self) -> Result<Self::Output, crate::RecvError> {
-        self.complete_recv()
-    }
-}
+impl_selectable_receiver!([T] Receiver<T>, T);
 
 // ════════════════════════════════════════════════════════════════════════════
 // SelectableSender impl for Sender<T>

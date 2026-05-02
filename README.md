@@ -14,7 +14,7 @@ with Crossbeam-style ergonomics and a small, focused API.
 - Bounded broadcast with lag detection (`Lagged { skipped }`)
 - Watch channel for latest-value subscriptions
 - Oneshot channel for single-send/single-delivery
-- Timer and disabled-arm helpers via `after()` and `never()`
+- Repeating timer receiver via `interval::interval()` and `interval::interval_at()`
 
 ## When to use
 
@@ -62,42 +62,62 @@ select! {
 | `bounded_broadcast` | Bounded multi-producer, multi-receiver broadcast with per-receiver cursors |
 | `watch` | Latest-value broadcast channel with versioned change notifications |
 | `oneshot` | Single-send, single-delivery channel |
+| `interval` | Repeating timer that yields `Instant` ticks on a fixed schedule |
 
 ## Selection model
 
-`select!` supports both recv and send arms:
+`select!` supports recv arms, send arms, and fallback arms:
 
-- `recv(rx) -> msg => { ... }`
-- `send(tx, value) -> res => { ... }`
-- `default => { ... }` for a non-blocking fallback
-- `default(duration) => { ... }` for a timed fallback
+```rust
+use std::time::Duration;
+use selectables::{bounded_mpmc, unbounded_mpmc, select};
+
+let (tx_bounded, rx_bounded) = bounded_mpmc::channel::<&str>(4);
+let (tx_unbounded, rx_unbounded) = unbounded_mpmc::channel::<i32>();
+
+tx_bounded.send("hello").unwrap();
+
+select! {
+    recv(rx_bounded) -> msg => println!("recv: {:?}", msg),
+    send(tx_unbounded, 42) -> res => println!("sent: {:?}", res),
+    default(Duration::from_millis(10)) => println!("timed out"),
+}
+```
+
+Arm syntax at a glance:
+
+| Arm | Fires when |
+|-----|------------|
+| `recv(rx) -> msg => { ... }` | a value is available on `rx` |
+| `send(tx, val) -> res => { ... }` | `tx` has buffer space (or is disconnected) |
+| `default => { ... }` | no arm is ready (non-blocking) |
+| `default(duration) => { ... }` | no arm is ready within the timeout |
 
 A low-level builder API is also available via `Select` and `SelectedOperation`.
 
 ## Lag handling (`bounded_broadcast`)
 
-Broadcast receivers may return `Lagged { skipped }` when they fall behind a
-bounded ring buffer.
-
-Recovery is straightforward:
+Broadcast receivers return `Lagged { skipped }` when they fall behind a
+bounded ring buffer.  The cursor is automatically advanced to the oldest
+surviving message, so the next call succeeds without any manual recovery.
 
 ```rust
-use selectables::RecvError;
+use selectables::{bounded_broadcast, RecvError};
 
-fn handle_recv<T>(result: Result<T, RecvError>) -> bool {
-    match result {
-        Ok(_msg) => true,
-        Err(RecvError::Lagged { skipped }) => {
-            eprintln!("receiver lagged by {} messages; recovered", skipped);
-            true
-        }
-        Err(RecvError::Disconnected) => false,
+let (tx, rx) = bounded_broadcast::channel::<i32>(8);
+
+tx.send(1).unwrap();
+
+match rx.recv() {
+    Ok(msg) => println!("got {}", msg),
+    Err(RecvError::Lagged { skipped }) => {
+        eprintln!("missed {} messages; resuming from oldest available", skipped);
     }
+    Err(RecvError::Disconnected) => println!("sender gone"),
 }
 ```
 
-After `Lagged`, the receiver cursor is automatically advanced to the oldest
-available message and subsequent recvs continue from there.
+See the [`bounded_broadcast`](https://docs.rs/selectables/latest/selectables/bounded_broadcast/index.html) module for detailed lag recovery patterns.
 
 ## Examples
 

@@ -82,6 +82,18 @@ pub(crate) fn new_recv_waiter_list() -> RecvWaiterList {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+/// Create and register a [`RecvWaiterGuard`] for a plain (non-`select!`) blocking recv call.
+///
+/// This is a convenience wrapper for the common slow-path pattern in blocking `recv()`
+/// implementations.  The waiter uses `case_id = UNSELECTED` as an identity-only token;
+/// the internal `selected` atomic is never observed by the caller — it exists solely to
+/// satisfy the [`RecvWaiter`] constructor signature.
+pub(crate) fn register_plain_recv_waiter(list: &RecvWaiterList) -> RecvWaiterGuard {
+    let marker = Arc::new(AtomicUsize::new(UNSELECTED));
+    let waiter = RecvWaiter::new(UNSELECTED, marker);
+    RecvWaiterGuard::register(waiter, list)
+}
+
 /// RAII guard that registers a [`RecvWaiter`] in a [`RecvWaiterList`] on
 /// construction and removes it on drop.
 ///
@@ -96,7 +108,9 @@ pub(crate) struct RecvWaiterGuard {
 impl RecvWaiterGuard {
     /// Insert `waiter` into `list` and return a guard that removes it on drop.
     pub(crate) fn register(waiter: Arc<RecvWaiter>, list: &RecvWaiterList) -> Self {
-        list.lock().unwrap().push(Arc::clone(&waiter));
+        list.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::clone(&waiter));
         RecvWaiterGuard {
             waiter,
             list: Arc::clone(list),
@@ -107,7 +121,7 @@ impl RecvWaiterGuard {
 impl Drop for RecvWaiterGuard {
     fn drop(&mut self) {
         let ptr = Arc::as_ptr(&self.waiter);
-        let mut guard = self.list.lock().unwrap();
+        let mut guard = self.list.lock().unwrap_or_else(|e| e.into_inner());
         guard.retain(|w| Arc::as_ptr(w) != ptr);
     }
 }
@@ -121,12 +135,12 @@ impl Drop for RecvWaiterGuard {
 /// waiter had already been claimed by another event.
 ///
 /// Called after a single message is pushed into a channel buffer.
-pub(crate) fn wake_one_recv_waiter(list: &RecvWaiterList, unselected: usize) -> bool {
-    let waiters: Vec<Arc<RecvWaiter>> = list.lock().unwrap().clone();
+pub(crate) fn wake_one_recv_waiter(list: &RecvWaiterList) -> bool {
+    let waiters: Vec<Arc<RecvWaiter>> = list.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for waiter in waiters {
         if waiter
             .selected
-            .compare_exchange(unselected, waiter.case_id, SeqCst, SeqCst)
+            .compare_exchange(UNSELECTED, waiter.case_id, SeqCst, SeqCst)
             .is_ok()
         {
             waiter.thread.unpark();
@@ -144,12 +158,12 @@ pub(crate) fn wake_one_recv_waiter(list: &RecvWaiterList, unselected: usize) -> 
 /// it can re-check channel state.
 ///
 /// Called on sender disconnect and in broadcast channels.
-pub(crate) fn wake_all_recv_waiters(list: &RecvWaiterList, unselected: usize) {
-    let waiters: Vec<Arc<RecvWaiter>> = list.lock().unwrap().clone();
+pub(crate) fn wake_all_recv_waiters(list: &RecvWaiterList) {
+    let waiters: Vec<Arc<RecvWaiter>> = list.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for waiter in waiters {
         waiter
             .selected
-            .compare_exchange(unselected, waiter.case_id, SeqCst, SeqCst)
+            .compare_exchange(UNSELECTED, waiter.case_id, SeqCst, SeqCst)
             .ok();
         waiter.thread.unpark();
     }
@@ -161,7 +175,7 @@ pub(crate) fn wake_all_recv_waiters(list: &RecvWaiterList, unselected: usize) {
 /// is no longer [`UNSELECTED`].  Used by MPSC sends that need to nudge blocked
 /// receivers without clobbering a waiter that is mid-`select!` on another arm.
 pub(crate) fn wake_all_unselected_recv_waiters(list: &RecvWaiterList) {
-    let waiters: Vec<Arc<RecvWaiter>> = list.lock().unwrap().clone();
+    let waiters: Vec<Arc<RecvWaiter>> = list.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for waiter in waiters {
         if waiter.selected.load(Acquire) == UNSELECTED {
             waiter.thread.unpark();
@@ -359,7 +373,7 @@ mod tests {
     // ── SelectWaiter tests ───────────────────────────────────────────────
 
     #[test]
-    fn test_select_waiter_push_and_wake_one() {
+    fn select_waiter_push_and_wake_one() {
         let stack = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let selected = Arc::new(AtomicUsize::new(UNSELECTED));
 
@@ -374,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_waiter_abort_skips() {
+    fn select_waiter_abort_skips() {
         let stack = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let selected = Arc::new(AtomicUsize::new(UNSELECTED));
 
@@ -390,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_wake_all_frees_nodes() {
+    fn select_wake_all_frees_nodes() {
         let stack = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let sel1 = Arc::new(AtomicUsize::new(UNSELECTED));
         let sel2 = Arc::new(AtomicUsize::new(UNSELECTED));
@@ -406,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_select_waiters_no_leak() {
+    fn drain_select_waiters_no_leak() {
         let stack = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let selected = Arc::new(AtomicUsize::new(UNSELECTED));
 
@@ -418,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn test_abort_only_matching_selected() {
+    fn abort_only_matching_selected() {
         let stack = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let sel_a = Arc::new(AtomicUsize::new(UNSELECTED));
         let sel_b = Arc::new(AtomicUsize::new(UNSELECTED));

@@ -22,9 +22,7 @@
 //! - Timed fallback: `default(duration) => { ... }`.
 //! - Low-level builder API is provided by [Select] and [SelectedOperation].
 //!
-//! ## Timers and disabled arms
-//! - [bounded_mpmc::after] and [bounded_mpsc::after] create one-shot timer receivers.
-//! - [bounded_mpmc::never] and [bounded_mpsc::never] create permanently non-firing receivers.
+//! ## Timers
 //! - [interval::interval] and [interval::interval_at] create repeating timer receivers.
 //!
 //! ## Error model
@@ -38,7 +36,7 @@
 //! behind the senders. This is normal and indicates the ring buffer wrapped around before the
 //! receiver caught up. Recommended handling:
 //!
-//! ```text
+//! ```rust,ignore
 //! match rx.recv() {
 //!     Ok(msg) => process(msg),
 //!     Err(RecvError::Lagged { skipped }) => {
@@ -57,7 +55,7 @@
 //! ## Quick example
 //! ```
 //! use std::time::Duration;
-//! use selectables::{Select, bounded_mpmc, select};
+//! use selectables::{bounded_mpmc, select};
 //!
 //! let (tx, rx) = bounded_mpmc::channel::<i32>(1);
 //! tx.send(7).unwrap();
@@ -66,10 +64,6 @@
 //!     recv(rx) -> msg => assert_eq!(msg, Ok(7)),
 //!     default(Duration::from_millis(10)) => panic!("unexpected timeout"),
 //! }
-//!
-//! let mut sel = Select::new();
-//! let i = sel.recv(bounded_mpmc::never::<i32>());
-//! let _ = i;
 //! ```
 
 use std::sync::Arc;
@@ -128,7 +122,10 @@ pub trait SelectableReceiver {
 /// `is_ready` returns `true` when a send can complete without blocking (buffer
 /// has space or the channel is disconnected). The select protocol uses the same
 /// four-phase algorithm as for receivers: try → register → park → complete.
-pub trait SelectableSender {
+///
+/// Implementors must also implement [`Clone`] because the `select!` macro clones
+/// the sender handle before handing it to the low-level [`Select`] builder.
+pub trait SelectableSender: Clone {
     /// The value type this sender accepts.
     type Input: Send;
     /// `true` when a send would complete immediately (buffer not full, or

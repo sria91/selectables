@@ -87,7 +87,7 @@
 //! - `send()` is lock-free: only updates atomics and wakes waiting receivers.
 //! - `try_recv()` is lock-free: uses atomic loads and CAS to detect lag.
 //! - `recv()` uses a Mutex only to manage the waiter list during blocking.
-//! - Per-receiver cursors are stored in `Arc<AtomicUsize>`, enabling independent lag tracking.
+//! - Per-receiver cursors are stored as per-`Receiver` `AtomicUsize` fields, each advancing independently.
 
 use std::{
     sync::Arc,
@@ -100,8 +100,8 @@ use arc_swap::ArcSwapOption;
 use crate::{
     error::{RecvError, SendError, TryRecvError},
     waiter::{
-        RecvWaiter, RecvWaiterGuard, RecvWaiterList, SelectWaiter, UNSELECTED,
-        abort_select_waiters, drain_select_waiters, new_recv_waiter_list, push_select_waiter,
+        RecvWaiterList, SelectWaiter, abort_select_waiters, drain_select_waiters,
+        new_recv_waiter_list, push_select_waiter, register_plain_recv_waiter,
         wake_all_recv_waiters, wake_all_unselected_recv_waiters, wake_select_all,
     },
 };
@@ -126,7 +126,9 @@ pub(crate) struct Chan<T> {
     write_seq: AtomicUsize,
     recv_waiters: RecvWaiterList,
     select_waiters: Arc<AtomicPtr<SelectWaiter>>,
+    /// Number of live `Sender<T>` handles; zero means all receivers observe disconnect.
     sender_count: AtomicUsize,
+    /// Number of live `Receiver<T>` handles; zero means senders observe disconnect.
     receiver_count: AtomicUsize,
 }
 
@@ -143,22 +145,34 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let prev = self.0.sender_count.fetch_sub(1, AcqRel);
         if prev == 1 {
-            wake_all_recv_waiters(&self.0.recv_waiters, UNSELECTED);
+            // Last sender dropped — wake all waiting receivers so they can
+            // observe the disconnected state.
+            wake_all_recv_waiters(&self.0.recv_waiters);
             wake_select_all(&self.0.select_waiters);
         }
     }
 }
 
 impl<T> Sender<T> {
+    /// Broadcast `value` to every live receiver.
+    ///
+    /// Returns `Err(SendError(value))` if there are no receivers left.
+    /// Never blocks — the ring advances regardless of receiver lag; slow
+    /// receivers will see a `Lagged` error on their next `recv` / `try_recv`.
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         if self.0.receiver_count.load(Acquire) == 0 {
             return Err(SendError(value));
         }
 
+        // Allocate the Arc *before* claiming a sequence number.
+        // If Arc::new panics (OOM), no slot has been claimed, so no receiver
+        // is left spinning on an unpublished sequence number.
+        let arc_value = Arc::new(value);
+
         let seq = self.0.write_seq.fetch_add(1, AcqRel);
         let slot = &self.0.slots[seq % self.0.cap];
 
-        slot.value.store(Some(Arc::new(value)));
+        slot.value.store(Some(arc_value));
         slot.seq.store(seq + 1, Release);
 
         // Broadcast channel should wake all potentially waiting receivers.
@@ -174,7 +188,7 @@ impl<T> Sender<T> {
 
 pub struct Receiver<T> {
     chan: Arc<Chan<T>>,
-    next_seq: Arc<AtomicUsize>,
+    next_seq: AtomicUsize,
 }
 
 impl<T> Clone for Receiver<T> {
@@ -183,7 +197,7 @@ impl<T> Clone for Receiver<T> {
         Receiver {
             chan: Arc::clone(&self.chan),
             // New subscribers start at current tail and observe future sends.
-            next_seq: Arc::new(AtomicUsize::new(self.chan.write_seq.load(Acquire))),
+            next_seq: AtomicUsize::new(self.chan.write_seq.load(Acquire)),
         }
     }
 }
@@ -198,6 +212,16 @@ impl<T> Drop for Receiver<T> {
 }
 
 impl<T: Clone> Receiver<T> {
+    /// Attempt to receive the next message without blocking.
+    ///
+    /// Returns:
+    /// - `Ok(value)` — a new message was available.
+    /// - `Err(TryRecvError::Empty)` — no message yet; try again later.
+    /// - `Err(TryRecvError::Lagged { skipped })` — this receiver fell behind;
+    ///   `skipped` messages were lost.  The cursor has been advanced to the
+    ///   oldest available message — the next call will succeed (or return
+    ///   `Empty` if no new messages have arrived).
+    /// - `Err(TryRecvError::Disconnected)` — all senders are gone.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         loop {
             let next = self.next_seq.load(Acquire);
@@ -234,6 +258,9 @@ impl<T: Clone> Receiver<T> {
             if seq_before > expected {
                 let write_now = self.chan.write_seq.load(Acquire);
                 let oldest_now = write_now.saturating_sub(self.chan.cap);
+                // .max(1): the slot was overwritten so at least one message was
+                // lost; guards against saturating_sub returning 0 if a concurrent
+                // sender advances write_seq between our two loads.
                 let skipped = oldest_now.saturating_sub(next).max(1);
                 self.next_seq.store(oldest_now, Release);
                 return Err(TryRecvError::Lagged { skipped });
@@ -242,6 +269,13 @@ impl<T: Clone> Receiver<T> {
             let snapshot = slot.value.load_full();
             let seq_after = slot.seq.load(Acquire);
             if seq_after != expected {
+                // A concurrent sender is mid-publish on this slot (it has
+                // incremented `write_seq` but not yet stored the final `seq`).
+                // We spin here.  **Safety note**: if a sender panics between
+                // `write_seq.fetch_add` and `slot.seq.store`, this spin becomes
+                // infinite.  Callers must guarantee senders do not panic after
+                // claiming a sequence number.
+                std::hint::spin_loop();
                 continue;
             }
 
@@ -252,33 +286,33 @@ impl<T: Clone> Receiver<T> {
         }
     }
 
+    /// Block until the next message is available.
+    ///
+    /// Returns:
+    /// - `Ok(value)` — the next message.
+    /// - `Err(RecvError::Lagged { skipped })` — this receiver fell behind;
+    ///   `skipped` messages were lost.
+    /// - `Err(RecvError::Disconnected)` — all senders are gone and the
+    ///   channel is empty.
     pub fn recv(&self) -> Result<T, RecvError> {
-        let marker = Arc::new(AtomicUsize::new(UNSELECTED));
         loop {
-            match self.try_recv() {
-                Ok(v) => return Ok(v),
-                Err(TryRecvError::Lagged { skipped }) => {
-                    return Err(RecvError::Lagged { skipped });
-                }
-                Err(TryRecvError::Disconnected) => return Err(RecvError::Disconnected),
-                Err(TryRecvError::Empty) => {}
-            }
-
-            let waiter = RecvWaiter::new(usize::MAX, Arc::clone(&marker));
-            let _guard = RecvWaiterGuard::register(waiter, &self.chan.recv_waiters);
-
-            // Re-check after push
+            // --- fast path ---
             match self.try_recv() {
                 Ok(v) => return Ok(v),
                 Err(TryRecvError::Lagged { skipped }) => return Err(RecvError::Lagged { skipped }),
                 Err(TryRecvError::Disconnected) => return Err(RecvError::Disconnected),
                 Err(TryRecvError::Empty) => {}
             }
-            if marker.load(Acquire) != UNSELECTED {
-                match self.try_recv() {
-                    Ok(v) => return Ok(v),
-                    _ => return Err(RecvError::Disconnected),
-                }
+
+            // --- slow path: register waiter, re-check, park ---
+            let _guard = register_plain_recv_waiter(&self.chan.recv_waiters);
+
+            // Re-check after registration to close the lost-wakeup window.
+            match self.try_recv() {
+                Ok(v) => return Ok(v),
+                Err(TryRecvError::Lagged { skipped }) => return Err(RecvError::Lagged { skipped }),
+                Err(TryRecvError::Disconnected) => return Err(RecvError::Disconnected),
+                Err(TryRecvError::Empty) => {}
             }
 
             thread::park();
@@ -305,36 +339,18 @@ impl<T: Clone> Receiver<T> {
         abort_select_waiters(&self.chan.select_waiters, selected);
     }
 
-    pub fn complete_recv(&self) -> Result<T, RecvError> {
+    pub(crate) fn complete_recv(&self) -> Result<T, RecvError> {
         self.recv()
     }
 }
 
-impl<T: Clone> crate::SelectableReceiver for Receiver<T> {
-    type Output = T;
-
-    fn is_ready(&self) -> bool {
-        self.is_ready()
-    }
-
-    fn register_select(
-        &self,
-        case_id: usize,
-        selected: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        self.register_select(case_id, selected)
-    }
-
-    fn abort_select(&self, selected: &std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        self.abort_select(selected)
-    }
-
-    fn complete(&self) -> Result<Self::Output, crate::RecvError> {
-        self.complete_recv()
-    }
-}
+impl_selectable_receiver!([T: Clone] Receiver<T>, T);
 
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    // Note: unlike `bounded_mpmc::channel`, which silently creates an
+    // always-full channel when `capacity == 0`, we assert here because a
+    // zero-capacity broadcast has no useful semantics (every send would
+    // immediately overwrite a slot that no receiver can see).
     assert!(capacity > 0, "broadcast capacity must be > 0");
 
     let slots: Box<[Slot<T>]> = (0..capacity).map(|_| Slot::new()).collect();
@@ -352,7 +368,7 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         Sender(Arc::clone(&chan)),
         Receiver {
             chan,
-            next_seq: Arc::new(AtomicUsize::new(0)),
+            next_seq: AtomicUsize::new(0),
         },
     )
 }
@@ -532,5 +548,53 @@ mod tests {
             assert_eq!(rx1.recv().unwrap(), i);
             assert_eq!(rx2.recv().unwrap(), i);
         }
+    }
+
+    /// Concurrent sender racing against a slow receiver exercises the TOCTOU
+    /// retry path in `try_recv` (`seq_after != expected → continue`) and
+    /// ensures lag is reported (not silently swallowed) when the buffer wraps.
+    #[test]
+    fn stress_concurrent_lag_detection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        const MSGS: usize = 2_000;
+        // Small capacity relative to total messages guarantees heavy lag.
+        let (tx, rx) = channel::<usize>(8);
+
+        let lag_count = Arc::new(AtomicUsize::new(0));
+        let lag_count2 = Arc::clone(&lag_count);
+
+        let sender = thread::spawn(move || {
+            for i in 0..MSGS {
+                tx.send(i).unwrap();
+            }
+        });
+
+        let receiver = thread::spawn(move || {
+            let mut received = 0usize;
+            loop {
+                match rx.recv() {
+                    Ok(_) => received += 1,
+                    Err(RecvError::Lagged { skipped }) => {
+                        lag_count2.fetch_add(skipped, Relaxed);
+                    }
+                    Err(RecvError::Disconnected) => break,
+                }
+            }
+            // Drain any remaining messages after disconnect.
+            received
+        });
+
+        sender.join().unwrap();
+        let received = receiver.join().unwrap();
+
+        // Every message was either received or accounted for as lag.
+        assert_eq!(received + lag_count.load(Relaxed), MSGS);
+        // The small buffer must have caused at least some lag.
+        assert!(
+            lag_count.load(Relaxed) > 0,
+            "expected lag but none observed"
+        );
     }
 }

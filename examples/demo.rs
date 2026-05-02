@@ -10,12 +10,11 @@ use std::{
 
 fn main() {
     unsafe { env::set_var("RUST_LOG", "trace") };
-    minimal_logger::init().unwrap();
+    minimal_logger::init(minimal_logger::config_from_env()).unwrap();
 
     demo_basic_select();
     demo_instant_default();
     demo_timeout_default();
-    demo_after_as_recv_arm();
     demo_disconnection();
     demo_bounded_channel();
     demo_mpsc_bounded();
@@ -23,7 +22,6 @@ fn main() {
     demo_bounded_broadcast();
     demo_oneshot_basic();
     demo_oneshot_select();
-    demo_never();
     demo_priority_without_macro();
     demo_interval();
 
@@ -39,7 +37,7 @@ fn demo_basic_select() {
 
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(30));
-        tx1.send("hello from ch1").unwrap();
+        let _ = tx1.send("hello from ch1");
     });
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(10));
@@ -82,33 +80,9 @@ fn demo_timeout_default() {
     }
 }
 
-// ── Demo 4: `after(dur)` used as a regular recv arm ──────────────────────
-fn demo_after_as_recv_arm() {
-    println!("\n╔══ Demo 4: after() as a recv arm ══╗");
-
-    let (tx, rx) = unbounded_mpmc::channel::<i32>();
-
-    // Race: which fires first — the sender or the timer?
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(60));
-        let _ = tx.send(42);
-    });
-
-    let timer1 = bounded_mpmc::after(Duration::from_millis(40)); // fires first
-    let timer2 = bounded_mpsc::after(Duration::from_millis(40)); // fires first
-
-    loop {
-        select! {
-            recv(rx)    -> msg => { println!("  data arrived: {:?}", msg); break; },
-            recv(timer1) -> _   => println!("  timer1 fired before data"),
-            recv(timer2) -> _   => println!("  timer2 fired before data"),
-        }
-    }
-}
-
-// ── Demo 5: Disconnection arrives through select ──────────────────────────
+// ── Demo 4: Disconnection arrives through select ──────────────────
 fn demo_disconnection() {
-    println!("\n╔══ Demo 5: detecting sender disconnect ══╗");
+    println!("\n╔══ Demo 4: detecting sender disconnect ══╗");
 
     let (tx, rx) = unbounded_mpmc::channel::<i32>();
     drop(tx); // drop the only sender immediately
@@ -119,9 +93,9 @@ fn demo_disconnection() {
     }
 }
 
-// ── Demo 6: Bounded channel with capacity limit ──────────────────────────
+// ── Demo 5: Bounded channel with capacity limit ──────────────────
 fn demo_bounded_channel() {
-    println!("\n╔══ Demo 6: bounded channel capacity ══╗");
+    println!("\n╔══ Demo 5: bounded channel capacity ══╗");
 
     let (tx, rx) = bounded_mpmc::channel::<i32>(2);
 
@@ -134,10 +108,10 @@ fn demo_bounded_channel() {
     println!("  recv -> {:?}", rx.recv().unwrap());
 }
 
-// ── Demo 6.5: bounded MPSC channel with select! ══╗
+// ── Demo 6: bounded MPSC channel with select! ══╗
 
 fn demo_mpsc_bounded() {
-    println!("\n╔══ Demo 6.5: bounded MPSC channel with select! ══╗");
+    println!("\n╔══ Demo 6: bounded MPSC channel with select! ══╗");
 
     let (tx1, rx1) = bounded_mpsc::channel::<&str>(2);
     let (tx2, rx2) = bounded_mpsc::channel::<&str>(2);
@@ -218,9 +192,9 @@ fn demo_mpsc_bounded() {
     }
 }
 
-// ── Demo 6.75: watch channel updates through recv arms ───────────────────
+// ── Demo 7: watch channel updates through recv arms ───────────────────────
 fn demo_watch_channel() {
-    println!("\n╔══ Demo 6.75: watch channel updates ══╗");
+    println!("\n╔══ Demo 7: watch channel updates ══╗");
 
     let (tx, rx) = watch::channel::<&str>();
     let tx_boot = tx.clone();
@@ -229,11 +203,7 @@ fn demo_watch_channel() {
         tx_boot.send("booting").unwrap();
     });
 
-    println!(
-        "  changed() -> version {:?}, value {:?}",
-        rx.changed(),
-        *rx.borrow()
-    );
+    println!("  changed() -> {:?}, value {:?}", rx.changed(), rx.borrow());
 
     let rx_for_select = rx.clone();
     thread::spawn(move || {
@@ -242,16 +212,16 @@ fn demo_watch_channel() {
     });
 
     select! {
-        recv(rx_for_select) -> version => println!("  select recv -> {:?}", version),
+        recv(rx_for_select) -> res => println!("  select recv -> {:?}", res),
         default(Duration::from_millis(100)) => println!("  watch timed out"),
     }
 
-    println!("  final value -> {:?}", *rx.borrow());
+    println!("  final value -> {:?}", rx.borrow());
 }
 
-// ── Demo 6.85: bounded broadcast with lag detection ─────────────────────
+// ── Demo 8: bounded broadcast with lag detection ─────────────────────────
 fn demo_bounded_broadcast() {
-    println!("\n╔══ Demo 6.85: bounded broadcast lag behavior + recovery ══╗");
+    println!("\n╔══ Demo 8: bounded broadcast lag behavior + recovery ══╗");
 
     let (tx, rx1) = bounded_broadcast::channel::<i32>(2);
     let rx2 = rx1.clone();
@@ -289,9 +259,9 @@ fn demo_bounded_broadcast() {
     }
 }
 
-// ── Demo 6.9: oneshot basics ─────────────────────────────────────────────
+// ── Demo 9: oneshot basics ─────────────────────────────────────────────────
 fn demo_oneshot_basic() {
-    println!("\n╔══ Demo 6.9: oneshot basic send/recv ══╗");
+    println!("\n╔══ Demo 9: oneshot basic send/recv ══╗");
 
     let (tx, rx) = oneshot::channel::<&str>();
     thread::spawn(move || {
@@ -302,9 +272,9 @@ fn demo_oneshot_basic() {
     println!("  recv -> {:?}", rx.recv());
 }
 
-// ── Demo 6.95: oneshot in select! recv arms ─────────────────────────────
+// ── Demo 10: oneshot in select! recv arms ───────────────────────────────────────
 fn demo_oneshot_select() {
-    println!("\n╔══ Demo 6.95: oneshot in select! recv arms ══╗");
+    println!("\n╔══ Demo 10: oneshot in select! recv arms ══╗");
 
     let (tx_data, rx_data) = unbounded_mpmc::channel::<i32>();
     let (tx_once, rx_once) = oneshot::channel::<&str>();
@@ -316,7 +286,7 @@ fn demo_oneshot_select() {
 
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(30));
-        tx_data.send(99).unwrap();
+        let _ = tx_data.send(99);
     });
 
     select! {
@@ -326,32 +296,12 @@ fn demo_oneshot_select() {
     }
 }
 
-// ── Demo 7: never() disables an arm ──────────────────────────────────────
-fn demo_never() {
-    println!("\n╔══ Demo 7: never() disables an arm ══╗");
-
-    let (tx, rx) = unbounded_mpmc::channel::<&str>();
-    tx.send("real message").unwrap();
-
-    // This arm is permanently not-ready; the `rx` arm wins.
-    let phantom1: bounded_mpmc::Receiver<&str> = bounded_mpmc::never();
-
-    // This arm is permanently not-ready; the `rx` arm wins.
-    let phantom2: bounded_mpsc::Receiver<&str> = bounded_mpsc::never();
-
-    select! {
-        recv(phantom1) -> _ => println!("  phantom1 fired (impossible)"),
-        recv(phantom2) -> _ => println!("  phantom2 fired (impossible)"),
-        recv(rx)      -> m => println!("  real arm: {:?}", m),
-    }
-}
-
-// ── Demo 7: Priority select without the macro ────────────────────────────
+// ── Demo 11: Priority select without the macro ──────────────────────────────
 //
 // `select!` rotates arms for fairness.  When you *always* want arm 0 to
 // take precedence, call try_recv directly first, then fall back to select.
 fn demo_priority_without_macro() {
-    println!("\n╔══ Demo 7: manual priority select (no macro) ══╗");
+    println!("\n╔══ Demo 11: manual priority select (no macro) ══╗");
 
     let (tx_hi, rx_hi) = unbounded_mpmc::channel::<&str>();
     let (tx_lo, rx_lo) = unbounded_mpmc::channel::<&str>();
@@ -371,8 +321,8 @@ fn demo_priority_without_macro() {
 
     if let Some(oper) = sel.try_select() {
         match oper.index {
-            i if i == i_hi => println!("  [hi] {:?}", rx_hi.complete_recv()),
-            i if i == i_lo => println!("  [lo] {:?}", rx_lo.complete_recv()),
+            i if i == i_hi => println!("  [hi] {:?}", SelectableReceiver::complete(&rx_hi)),
+            i if i == i_lo => println!("  [lo] {:?}", SelectableReceiver::complete(&rx_lo)),
             _ => unreachable!(),
         }
     } else {
@@ -380,9 +330,9 @@ fn demo_priority_without_macro() {
     }
 }
 
-// ── Demo 8: selectable interval ───────────────────────────────────────────
+// ── Demo 12: selectable interval ───────────────────────────────────────────────────────
 fn demo_interval() {
-    println!("\n╔══ Demo 8: selectable interval ══╗");
+    println!("\n╔══ Demo 12: selectable interval ══╗");
 
     let iv = interval::interval(Duration::from_millis(50));
     let (tx, rx) = unbounded_mpmc::channel::<&str>();

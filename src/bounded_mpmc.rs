@@ -46,16 +46,15 @@ use std::{
     sync::Arc,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering::*},
     thread,
-    time::{Duration, Instant},
 };
 
 use crate::{
     error::{RecvError, SendError, TryRecvError},
     internals::LockFreeBoundedRing,
     waiter::{
-        RecvWaiter, RecvWaiterGuard, RecvWaiterList, SelectWaiter, UNSELECTED,
-        abort_select_waiters, new_recv_waiter_list, push_select_waiter, wake_all_recv_waiters,
-        wake_one_recv_waiter, wake_select_all, wake_select_one,
+        RecvWaiterList, SelectWaiter, abort_select_waiters, drain_select_waiters,
+        new_recv_waiter_list, push_select_waiter, register_plain_recv_waiter,
+        wake_all_recv_waiters, wake_one_recv_waiter, wake_select_all, wake_select_one,
     },
 };
 
@@ -67,9 +66,9 @@ pub(crate) struct Chan<T> {
     ring: LockFreeBoundedRing<T>,
     recv_waiters: RecvWaiterList,
     select_waiters: Arc<AtomicPtr<SelectWaiter>>,
-    pub(crate) sender_count: AtomicUsize,
+    sender_count: AtomicUsize,
     /// Number of live `Receiver<T>` handles; tracked so senders can detect disconnect.
-    pub(crate) receiver_count: AtomicUsize,
+    receiver_count: AtomicUsize,
     /// Select waiters registered by `SelectableSender::register_select`; woken when
     /// buffer space becomes available (receiver pops) or all receivers disconnect.
     send_select_waiters: Arc<AtomicPtr<SelectWaiter>>,
@@ -94,26 +93,41 @@ impl<T> Drop for Sender<T> {
         if prev == 1 {
             // Last sender dropped — wake all waiting receivers so they can
             // observe the disconnected state.
-            wake_all_recv_waiters(&self.0.recv_waiters, UNSELECTED);
+            wake_all_recv_waiters(&self.0.recv_waiters);
             wake_select_all(&self.0.select_waiters);
         }
     }
 }
 
 impl<T> Sender<T> {
-    /// Send a value. Returns `Err(SendError(val))` if the buffer is full.
+    /// Send a value. Returns `Err(SendError(val))` if the buffer is full or all
+    /// receivers have been dropped.
     ///
     /// This is entirely lock-free for the enqueue step.  The wakeup of a
     /// waiting receiver acquires the `waiters` mutex briefly.
+    ///
+    /// **Note:** `Ok(())` confirms the value was accepted into the ring buffer
+    /// but does not guarantee a receiver is still live — the last receiver may
+    /// drop concurrently after the disconnected check and before the push.
+    /// The value will be freed when the channel tears down.
     pub fn send(&self, val: T) -> Result<(), SendError<T>> {
+        // Fail-fast: bail if all receivers are gone.
+        if self.0.receiver_count.load(Acquire) == 0 {
+            return Err(SendError(val));
+        }
         // Lock-free enqueue.
         self.0.ring.try_push(val).map_err(SendError)?;
 
         // Wake at most one waiting receiver — we pushed exactly one item.
         // (wake_one_recv_waiter returns bool and handles unpark internally)
-        wake_one_recv_waiter(&self.0.recv_waiters, UNSELECTED);
+        wake_one_recv_waiter(&self.0.recv_waiters);
         wake_select_one(&self.0.select_waiters);
         Ok(())
+    }
+
+    /// Returns `true` if all [`Receiver`] handles have been dropped.
+    pub fn is_closed(&self) -> bool {
+        self.0.receiver_count.load(Acquire) == 0
     }
 }
 
@@ -134,8 +148,10 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let prev = self.0.receiver_count.fetch_sub(1, AcqRel);
         if prev == 1 {
-            // Last receiver dropped — wake all send-side select waiters so
+            // Last receiver dropped — free any Box<SelectWaiter> nodes left on the
+            // recv select_waiters stack, then wake send-side select waiters so
             // blocked send arms observe the disconnect.
+            drain_select_waiters(&self.0.select_waiters);
             wake_select_all(&self.0.send_select_waiters);
         }
     }
@@ -178,9 +194,7 @@ impl<T> Receiver<T> {
             }
 
             // --- slow path: register waiter, re-check, park ---
-            let marker = Arc::new(AtomicUsize::new(UNSELECTED));
-            let waiter = RecvWaiter::new(usize::MAX, Arc::clone(&marker));
-            let _guard = RecvWaiterGuard::register(waiter, &self.0.recv_waiters);
+            let _guard = register_plain_recv_waiter(&self.0.recv_waiters);
 
             // TOCTOU check inside critical section (after push, before park)
             if let Some(msg) = self.0.ring.try_pop() {
@@ -204,7 +218,7 @@ impl<T> Receiver<T> {
     }
 
     pub(crate) fn register_select(&self, case_id: usize, selected: Arc<AtomicUsize>) {
-        log_trace!(
+        log_debug!(
             "bounded_mpmc::register_select: chan={:p}, case_id={}",
             Arc::as_ptr(&self.0),
             case_id
@@ -214,7 +228,7 @@ impl<T> Receiver<T> {
     }
 
     pub(crate) fn abort_select(&self, selected: &Arc<AtomicUsize>) {
-        log_trace!(
+        log_debug!(
             "bounded_mpmc::abort_select: chan={:p}",
             Arc::as_ptr(&self.0)
         );
@@ -225,34 +239,12 @@ impl<T> Receiver<T> {
     /// multi-consumer scenario where a concurrent receiver stole the item
     /// between selection and completion, we block until the next message
     /// arrives rather than returning a spurious error.
-    pub fn complete_recv(&self) -> Result<T, RecvError> {
+    pub(crate) fn complete_recv(&self) -> Result<T, RecvError> {
         self.recv()
     }
 }
 
-impl<T> crate::SelectableReceiver for Receiver<T> {
-    type Output = T;
-
-    fn is_ready(&self) -> bool {
-        self.is_ready()
-    }
-
-    fn register_select(
-        &self,
-        case_id: usize,
-        selected: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        self.register_select(case_id, selected)
-    }
-
-    fn abort_select(&self, selected: &std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        self.abort_select(selected)
-    }
-
-    fn complete(&self) -> Result<Self::Output, crate::RecvError> {
-        self.complete_recv()
-    }
-}
+impl_selectable_receiver!([T] Receiver<T>, T);
 
 // ════════════════════════════════════════════════════════════════════════════
 // SelectableSender impl for Sender<T>
@@ -304,49 +296,6 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     (Sender(Arc::clone(&chan)), Receiver(chan))
 }
 
-/// One-shot `Receiver<Instant>` that fires once after `duration`.
-pub fn after(duration: Duration) -> Receiver<Instant> {
-    let chan = Arc::new(Chan {
-        ring: LockFreeBoundedRing::new(1),
-        recv_waiters: new_recv_waiter_list(),
-        select_waiters: Arc::new(AtomicPtr::new(std::ptr::null_mut())),
-        sender_count: AtomicUsize::new(1),
-        receiver_count: AtomicUsize::new(1),
-        send_select_waiters: Arc::new(AtomicPtr::new(std::ptr::null_mut())),
-    });
-    let rx = Receiver(Arc::clone(&chan));
-    if let Err(error) = thread::Builder::new()
-        .name("selectables::mpmc_after".to_owned())
-        .spawn(move || {
-            thread::sleep(duration);
-            let _ = chan.ring.try_push(Instant::now());
-
-            // Wake one waiter because this timer publishes exactly one value.
-            // (wake_one_recv_waiter returns bool and handles unpark internally)
-            wake_one_recv_waiter(&chan.recv_waiters, UNSELECTED);
-            wake_select_one(&chan.select_waiters);
-        })
-    {
-        eprintln!("failed to spawn 'mpmc_after' thread: {}", error);
-    }
-    rx
-}
-
-/// A `Receiver<T>` that never yields values and never disconnects.
-///
-/// Builds receiver-only channel state with `sender_count = 1` and no Sender
-/// handle, so the count never decrements while the receiver exists.
-pub fn never<T>() -> Receiver<T> {
-    Receiver(Arc::new(Chan {
-        ring: LockFreeBoundedRing::new(0),
-        recv_waiters: new_recv_waiter_list(),
-        select_waiters: Arc::new(AtomicPtr::new(std::ptr::null_mut())),
-        sender_count: AtomicUsize::new(1),
-        receiver_count: AtomicUsize::new(1),
-        send_select_waiters: Arc::new(AtomicPtr::new(std::ptr::null_mut())),
-    }))
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -355,14 +304,12 @@ pub fn never<T>() -> Receiver<T> {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::thread;
-    use std::time::Duration;
 
-    use crate::{Select, select};
+    use crate::select;
 
     #[test]
-    fn test_basic_send_recv() {
+    fn basic_send_recv() {
         let (tx, rx) = channel(4);
         tx.send(1).unwrap();
         tx.send(2).unwrap();
@@ -371,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_recv_empty_and_full() {
+    fn try_recv_empty_and_full() {
         let (tx, rx) = channel(2);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
         tx.send(1).unwrap();
@@ -384,31 +331,13 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_capacity_always_full() {
+    fn zero_capacity_always_full() {
         let (tx, _rx) = channel::<i32>(0);
         assert!(tx.send(42).is_err());
     }
 
     #[test]
-    fn test_never_channel_is_alive_but_empty() {
-        let rx: Receiver<i32> = never();
-        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
-
-        let mut sel = Select::new();
-        sel.recv(rx.clone());
-        assert!(sel.try_select().is_none());
-    }
-
-    #[test]
-    fn test_after_fires_once() {
-        let rx = after(Duration::from_millis(30));
-        let t = rx.recv().unwrap();
-        assert!(t.elapsed() < Duration::from_secs(5));
-        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
-    }
-
-    #[test]
-    fn test_sender_drop_disconnects() {
+    fn sender_drop_disconnects() {
         let (tx, rx) = channel::<i32>(4);
         tx.send(1).unwrap();
         drop(tx);
@@ -418,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_sender_keeps_alive() {
+    fn clone_sender_keeps_alive() {
         let (tx1, rx) = channel(4);
         let tx2 = tx1.clone();
         drop(tx1);
@@ -429,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_senders() {
+    fn multiple_senders() {
         let (tx1, rx) = channel(16);
         let tx2 = tx1.clone();
         let tx3 = tx1.clone();
@@ -442,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_receivers() {
+    fn multiple_receivers() {
         let (tx, rx1) = channel(16);
         let rx2 = rx1.clone();
         tx.send(10).unwrap();
@@ -455,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn test_blocking_recv_woken_by_send() {
+    fn blocking_recv_woken_by_send() {
         let (tx, rx) = channel(4);
         let handle = thread::spawn(move || rx.recv().unwrap());
         thread::sleep(std::time::Duration::from_millis(20));
@@ -464,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_blocking_recv_woken_by_disconnect() {
+    fn blocking_recv_woken_by_disconnect() {
         let (tx, rx) = channel::<i32>(4);
         let handle = thread::spawn(move || rx.recv());
         thread::sleep(std::time::Duration::from_millis(20));
@@ -473,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_ready() {
+    fn is_ready() {
         let (tx, rx) = channel(4);
         assert!(!rx.is_ready());
         tx.send(1).unwrap();
@@ -485,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_producers_consumers() {
+    fn concurrent_producers_consumers() {
         const PRODUCERS: usize = 4;
         const PER_PRODUCER: usize = 256;
         const TOTAL: usize = PRODUCERS * PER_PRODUCER;
@@ -518,7 +447,7 @@ mod tests {
                 loop {
                     match rx.try_recv() {
                         Ok(_) => {
-                            received.fetch_add(1, Ordering::Relaxed);
+                            received.fetch_add(1, Relaxed);
                         }
                         Err(TryRecvError::Empty) => thread::yield_now(),
                         Err(TryRecvError::Disconnected) => return,
@@ -532,11 +461,11 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(received.load(Ordering::Relaxed), TOTAL);
+        assert_eq!(received.load(Relaxed), TOTAL);
     }
 
     #[test]
-    fn test_drop_values_in_buffer() {
+    fn drop_values_in_buffer() {
         use std::sync::atomic::AtomicBool;
         static DROPPED: AtomicBool = AtomicBool::new(false);
 
@@ -544,7 +473,7 @@ mod tests {
         struct Guard;
         impl Drop for Guard {
             fn drop(&mut self) {
-                DROPPED.store(true, Ordering::Relaxed);
+                DROPPED.store(true, Relaxed);
             }
         }
 
@@ -552,11 +481,11 @@ mod tests {
         tx.send(Guard).unwrap();
         drop(tx);
         drop(rx); // Guard should be dropped here
-        assert!(DROPPED.load(Ordering::Relaxed));
+        assert!(DROPPED.load(Relaxed));
     }
 
     #[test]
-    fn test_fifo_ordering() {
+    fn fifo_ordering() {
         let (tx, rx) = channel(16);
         for i in 0..8u32 {
             tx.send(i).unwrap();
@@ -567,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recv_drains_before_disconnect() {
+    fn recv_drains_before_disconnect() {
         let (tx, rx) = channel(4);
         tx.send(1).unwrap();
         tx.send(2).unwrap();
@@ -578,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn test_send_select_wakes_when_receiver_pops() {
+    fn send_select_wakes_when_receiver_pops() {
         let (tx, rx) = channel::<i32>(1);
         tx.send(1).unwrap(); // fill the buffer
 
@@ -598,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_ready_when_disconnected_and_empty() {
+    fn select_ready_when_disconnected_and_empty() {
         let (tx, rx) = channel::<i32>(4);
         drop(tx);
         // Disconnected state counts as ready for recv arms.

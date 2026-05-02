@@ -43,7 +43,7 @@
 
 use std::{
     sync::Arc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::AtomicUsize,
     thread,
     time::{Duration, Instant},
 };
@@ -110,8 +110,7 @@ impl Interval {
 ///
 /// # Panics
 ///
-/// Does not panic.  If the background thread fails to spawn, a message is printed to stderr
-/// and the `Interval` will never fire (behaves like [`crate::bounded_mpmc::never`]).
+/// Panics if the OS fails to spawn the background tick thread (extremely rare).
 pub fn interval(period: Duration) -> Interval {
     interval_at(Instant::now(), period)
 }
@@ -122,14 +121,13 @@ pub fn interval(period: Duration) -> Interval {
 ///
 /// # Panics
 ///
-/// Does not panic.  If the background thread fails to spawn, a message is printed to stderr
-/// and the `Interval` will never fire (behaves like [`crate::bounded_mpmc::never`]).
+/// Panics if the OS fails to spawn the background tick thread (extremely rare).
 pub fn interval_at(start: Instant, period: Duration) -> Interval {
     // Use a capacity-1 bounded channel. The Sender is moved into the tick thread and
     // kept alive for as long as the thread runs; dropping it signals disconnection.
     let (tx, rx) = bounded_mpmc::channel::<Instant>(1);
 
-    if let Err(err) = thread::Builder::new()
+    thread::Builder::new()
         .name("selectables::interval".to_owned())
         .spawn(move || {
             let mut next_tick = start;
@@ -141,7 +139,7 @@ pub fn interval_at(start: Instant, period: Duration) -> Interval {
                 }
 
                 // Stop if all Interval handles have been dropped.
-                if tx.0.receiver_count.load(Ordering::Acquire) == 0 {
+                if tx.is_closed() {
                     break;
                 }
 
@@ -151,9 +149,7 @@ pub fn interval_at(start: Instant, period: Duration) -> Interval {
                 next_tick += period;
             }
         })
-    {
-        eprintln!("selectables: failed to spawn interval thread: {err}");
-    }
+        .expect("failed to spawn 'selectables::interval' timer thread");
 
     Interval(rx)
 }
@@ -170,7 +166,7 @@ mod tests {
 
     /// The interval fires at least `n` ticks and the gaps between them are ≥ period.
     #[test]
-    fn test_interval_fires_multiple_ticks() {
+    fn interval_fires_multiple_ticks() {
         let period = Duration::from_millis(20);
         let iv = interval(period);
 
@@ -193,7 +189,7 @@ mod tests {
 
     /// The interval participates in select! — the recv arm fires before the deadline.
     #[test]
-    fn test_interval_selectable() {
+    fn interval_selectable() {
         let iv = interval(Duration::from_millis(10));
         let deadline = Duration::from_millis(500);
 
@@ -207,7 +203,7 @@ mod tests {
 
     /// interval_at defers the first tick until the given Instant.
     #[test]
-    fn test_interval_at_defers_first_tick() {
+    fn interval_at_defers_first_tick() {
         let delay = Duration::from_millis(30);
         let start = Instant::now() + delay;
         let iv = interval_at(start, Duration::from_millis(100));
@@ -229,7 +225,7 @@ mod tests {
 
     /// Dropping all Interval handles stops the background tick thread.
     #[test]
-    fn test_interval_drop_stops_thread() {
+    fn interval_drop_stops_thread() {
         let iv = interval(Duration::from_millis(10));
         let iv2 = iv.clone();
         drop(iv);
@@ -237,5 +233,30 @@ mod tests {
         // Give the thread time to notice receiver_count == 0 and exit.
         thread::sleep(Duration::from_millis(50));
         // No assertion — this test just checks there is no panic or hang.
+    }
+
+    /// interval_at with a materially deferred start fires ticks at the correct
+    /// cadence and respects the missed-tick skip policy.
+    #[test]
+    fn interval_at_full_deferred_schedule() {
+        let delay = Duration::from_millis(60);
+        let period = Duration::from_millis(30);
+        let start = Instant::now() + delay;
+        let iv = interval_at(start, period);
+
+        // First tick must not arrive before `start`.
+        let t0 = iv.tick().unwrap();
+        assert!(
+            t0 >= start - Duration::from_millis(5),
+            "first tick arrived before deferred start: t0={t0:?}, start={start:?}"
+        );
+
+        // Subsequent ticks must each arrive at least `period` apart.
+        let t1 = iv.tick().unwrap();
+        assert!(
+            t1.duration_since(t0) >= period.saturating_sub(Duration::from_millis(5)),
+            "second tick arrived too early: gap={:?}, period={period:?}",
+            t1.duration_since(t0)
+        );
     }
 }

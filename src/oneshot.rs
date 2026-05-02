@@ -9,10 +9,16 @@
 //! # Semantics
 //!
 //! - `Sender` can only call `send()` once; consumes the sender
-//! - `Receiver` can only call `recv()` once; consumes the receiver
-//! - Attempting to send twice is a compile error (type state: `Sender` moves into itself on send)
+//! - `Receiver::recv()` blocks until the sender delivers or drops
 //! - If sender drops without sending, receiver gets `RecvError::Disconnected`
 //! - If receiver drops without receiving, sender's `send()` returns `SendError(value)`
+//!
+//! # Clone semantics
+//!
+//! `Receiver` is `Clone` to support `select!` integration (the macro clones receiver
+//! handles for arm registration).  Cloning a `Receiver` creates a second handle that
+//! races for the same single value: whichever clone takes the value first wins and the
+//! other gets `Err(RecvError::Disconnected)`.  Avoid cloning outside of `select!`.
 //!
 //! # Lock-free storage
 //!
@@ -33,8 +39,7 @@
 //! // Blocks until sender sends or drops
 //! match rx.recv() {
 //!     Ok(msg) => println!("Got: {}", msg),
-//!     Err(RecvError::Disconnected) => println!("Sender dropped"),
-//!     Err(RecvError::Lagged { .. }) => unreachable!("oneshot cannot lag"),
+//!     Err(RecvError::Disconnected) => println!("Sender dropped without sending"),
 //! }
 //! ```
 //!
@@ -63,15 +68,36 @@ use arc_swap::ArcSwapOption;
 use crate::{
     error::{RecvError, SendError, TryRecvError},
     waiter::{
-        RecvWaiter, RecvWaiterGuard, RecvWaiterList, SelectWaiter, UNSELECTED,
-        abort_select_waiters, drain_select_waiters, new_recv_waiter_list, push_select_waiter,
+        RecvWaiterList, SelectWaiter, abort_select_waiters, drain_select_waiters,
+        new_recv_waiter_list, push_select_waiter, register_plain_recv_waiter,
         wake_all_recv_waiters, wake_one_recv_waiter, wake_select_all, wake_select_one,
     },
 };
 
-const SENDER_OPEN: usize = 0;
-const SENDER_SENT: usize = 1;
-const SENDER_DROPPED: usize = 2;
+/// Tracks the lifecycle of the oneshot sender.
+///
+/// Stored in an `AtomicUsize` so it can be updated from `Sender::send` (which
+/// consumes `self`) and observed from `Receiver` concurrently.
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderState {
+    /// Sender is alive and has not yet called `send()`.
+    Open = 0,
+    /// `send()` was called; the value is in the `ArcSwapOption`.
+    Sent = 1,
+    /// Sender was dropped without calling `send()`.
+    Dropped = 2,
+}
+
+impl From<usize> for SenderState {
+    fn from(v: usize) -> Self {
+        match v {
+            0 => Self::Open,
+            1 => Self::Sent,
+            _ => Self::Dropped,
+        }
+    }
+}
 
 struct ValueCell<T> {
     taken: std::sync::atomic::AtomicBool,
@@ -126,20 +152,23 @@ pub(crate) struct Chan<T> {
 pub struct Sender<T>(pub(crate) Arc<Chan<T>>);
 
 impl<T> Sender<T> {
-    pub fn send(self, val: T) -> Result<(), SendError<T>> {
-        if self.0.receiver_count.load(Acquire) == 0 {
-            return Err(SendError(val));
-        }
+    /// Returns `true` if all [`Receiver`] handles have been dropped.
+    pub fn is_closed(&self) -> bool {
+        self.0.receiver_count.load(Acquire) == 0
+    }
 
+    pub fn send(self, val: T) -> Result<(), SendError<T>> {
         if self.0.receiver_count.load(Acquire) == 0 {
             return Err(SendError(val));
         }
 
         self.0.value.store(Some(Arc::new(ValueCell::new(val))));
 
-        self.0.sender_state.store(SENDER_SENT, Release);
+        self.0
+            .sender_state
+            .store(SenderState::Sent as usize, Release);
         // Wake one from recv lock-free stack
-        wake_one_recv_waiter(&self.0.recv_waiters, UNSELECTED);
+        wake_one_recv_waiter(&self.0.recv_waiters);
         // Wake one select waiter (lock-free)
         wake_select_one(&self.0.select_waiters);
         Ok(())
@@ -151,11 +180,16 @@ impl<T> Drop for Sender<T> {
         if self
             .0
             .sender_state
-            .compare_exchange(SENDER_OPEN, SENDER_DROPPED, AcqRel, Acquire)
+            .compare_exchange(
+                SenderState::Open as usize,
+                SenderState::Dropped as usize,
+                AcqRel,
+                Acquire,
+            )
             .is_ok()
         {
             // Wake all recv waiters (lock-free)
-            wake_all_recv_waiters(&self.0.recv_waiters, UNSELECTED);
+            wake_all_recv_waiters(&self.0.recv_waiters);
             // Wake all select waiters (lock-free, frees nodes)
             wake_select_all(&self.0.select_waiters);
         }
@@ -173,7 +207,7 @@ impl<T> Clone for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        let prev = self.0.receiver_count.fetch_sub(1, Release);
+        let prev = self.0.receiver_count.fetch_sub(1, AcqRel);
         if prev == 1 {
             // Last receiver dropped — drain any heap-allocated select waiters
             // to avoid memory leaks.
@@ -184,7 +218,7 @@ impl<T> Drop for Receiver<T> {
 
 impl<T> Receiver<T> {
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        if self.0.sender_state.load(Acquire) == SENDER_SENT {
+        if SenderState::from(self.0.sender_state.load(Acquire)) == SenderState::Sent {
             if let Some(cell) = self.0.value.swap(None) {
                 if let Some(val) = cell.take() {
                     return Ok(val);
@@ -193,7 +227,7 @@ impl<T> Receiver<T> {
             return Err(TryRecvError::Disconnected);
         }
 
-        if self.0.sender_state.load(Acquire) == SENDER_OPEN {
+        if SenderState::from(self.0.sender_state.load(Acquire)) == SenderState::Open {
             Err(TryRecvError::Empty)
         } else {
             Err(TryRecvError::Disconnected)
@@ -201,59 +235,41 @@ impl<T> Receiver<T> {
     }
 
     pub fn recv(&self) -> Result<T, RecvError> {
-        let marker = Arc::new(AtomicUsize::new(UNSELECTED));
         loop {
             match self.try_recv() {
                 Ok(v) => return Ok(v),
                 Err(TryRecvError::Disconnected) => return Err(RecvError::Disconnected),
-                Err(TryRecvError::Lagged { skipped }) => {
-                    return Err(RecvError::Lagged { skipped });
-                }
                 Err(TryRecvError::Empty) => {}
+                // oneshot channels cannot produce Lagged; this arm is unreachable.
+                Err(TryRecvError::Lagged { .. }) => unreachable!("oneshot cannot lag"),
             }
 
-            // TOCTOU check before parking: try_recv again and check sender state
+            if self.0.sender_state.load(Acquire) != SenderState::Open as usize {
+                return Err(RecvError::Disconnected);
+            }
+
+            // --- slow path: register waiter, re-check, park ---
+            let _guard = register_plain_recv_waiter(&self.0.recv_waiters);
+
+            // Re-check after registration to close the lost-wakeup window.
             if let Some(v) = self.try_recv().ok() {
                 return Ok(v);
             }
-            if self.0.sender_state.load(Acquire) != SENDER_OPEN {
+            if self.0.sender_state.load(Acquire) != SenderState::Open as usize {
                 return Err(RecvError::Disconnected);
             }
 
-            // Create waiter and push onto lock-free stack (recv path only)
-            let waiter = RecvWaiter::new(usize::MAX, Arc::clone(&marker));
-            let _guard = RecvWaiterGuard::register(waiter, &self.0.recv_waiters);
-
-            // Another TOCTOU check after pushing (sender might have sent while we pushed)
-            if let Some(v) = self.try_recv().ok() {
-                return Ok(v);
-            }
-            if self.0.sender_state.load(Acquire) != SENDER_OPEN {
-                return Err(RecvError::Disconnected);
-            }
-
-            // Check if we were already selected (by sender)
-            if marker.load(Acquire) != UNSELECTED {
-                // Sender beat us to marking; try recv again
-                if let Some(v) = self.try_recv().ok() {
-                    return Ok(v);
-                }
-                // Sender said done but value not available (race); treat as disconnected
-                return Err(RecvError::Disconnected);
-            }
-
-            // Park until woken
             thread::park();
         }
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        self.0.sender_state.load(Acquire) != SENDER_OPEN
+        self.0.sender_state.load(Acquire) != SenderState::Open as usize
     }
 
     pub(crate) fn register_select(&self, case_id: usize, selected: Arc<AtomicUsize>) {
         // Fast check: if channel already delivered/dropped, no need to register.
-        if self.0.sender_state.load(Acquire) != SENDER_OPEN {
+        if self.0.sender_state.load(Acquire) != SenderState::Open as usize {
             return;
         }
         // Allocate and push onto lock-free stack. Node is freed by sender or drain.
@@ -267,41 +283,19 @@ impl<T> Receiver<T> {
         abort_select_waiters(&self.0.select_waiters, selected);
     }
 
-    pub fn complete_recv(&self) -> Result<T, RecvError> {
+    pub(crate) fn complete_recv(&self) -> Result<T, RecvError> {
         self.recv()
     }
 }
 
-impl<T> crate::SelectableReceiver for Receiver<T> {
-    type Output = T;
-
-    fn is_ready(&self) -> bool {
-        self.is_ready()
-    }
-
-    fn register_select(
-        &self,
-        case_id: usize,
-        selected: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        self.register_select(case_id, selected)
-    }
-
-    fn abort_select(&self, selected: &std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        self.abort_select(selected)
-    }
-
-    fn complete(&self) -> Result<Self::Output, crate::RecvError> {
-        self.complete_recv()
-    }
-}
+impl_selectable_receiver!([T] Receiver<T>, T);
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let chan = Arc::new(Chan {
         value: ArcSwapOption::empty(),
         recv_waiters: new_recv_waiter_list(),
         select_waiters: Arc::new(AtomicPtr::new(std::ptr::null_mut())),
-        sender_state: AtomicUsize::new(SENDER_OPEN),
+        sender_state: AtomicUsize::new(SenderState::Open as usize),
         receiver_count: AtomicUsize::new(1),
     });
     (Sender(Arc::clone(&chan)), Receiver(chan))

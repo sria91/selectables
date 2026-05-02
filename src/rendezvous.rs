@@ -59,11 +59,10 @@ use std::{
 
 use crate::{
     error::{RecvError, SendError, TryRecvError},
-    internals::UNSELECTED,
     waiter::{
-        RecvWaiter, RecvWaiterGuard, RecvWaiterList, SelectWaiter, abort_select_waiters,
-        drain_select_waiters, new_recv_waiter_list, push_select_waiter, wake_all_recv_waiters,
-        wake_select_all, wake_select_one,
+        RecvWaiterList, SelectWaiter, abort_select_waiters, drain_select_waiters,
+        new_recv_waiter_list, push_select_waiter, register_plain_recv_waiter,
+        wake_all_recv_waiters, wake_select_all, wake_select_one,
     },
 };
 
@@ -170,7 +169,7 @@ impl<T: Send> Sender<T> {
 
         // Notify one waiting receiver that a sender has parked.
         // This covers both plain recv() and select arms.
-        wake_all_recv_waiters(&self.0.recv_waiters, UNSELECTED);
+        wake_all_recv_waiters(&self.0.recv_waiters);
         wake_select_one(&self.0.select_waiters);
 
         // Park loop: wait until receiver sets `taken` or all receivers drop.
@@ -243,9 +242,16 @@ impl<T> Drop for Sender<T> {
         let prev = self.0.sender_count.fetch_sub(1, AcqRel);
         if prev == 1 {
             // Last sender: wake all waiting receivers so they observe disconnect.
-            wake_all_recv_waiters(&self.0.recv_waiters, UNSELECTED);
+            wake_all_recv_waiters(&self.0.recv_waiters);
             wake_select_all(&self.0.select_waiters);
         }
+    }
+}
+
+impl<T> Sender<T> {
+    /// Returns `true` if all [`Receiver`] handles have been dropped.
+    pub fn is_closed(&self) -> bool {
+        self.0.receiver_count.load(Acquire) == 0
     }
 }
 
@@ -280,9 +286,7 @@ impl<T: Send> Receiver<T> {
             }
 
             // Slow path: register as a waiter, re-check, then park.
-            let marker = Arc::new(AtomicUsize::new(UNSELECTED));
-            let waiter = RecvWaiter::new(usize::MAX, Arc::clone(&marker));
-            let _guard = RecvWaiterGuard::register(waiter, &self.0.recv_waiters);
+            let _guard = register_plain_recv_waiter(&self.0.recv_waiters);
 
             // Notify any send-select arms that a receiver is now parked.
             wake_select_one(&self.0.send_select_waiters);
@@ -347,14 +351,16 @@ impl<T: Send> Receiver<T> {
         abort_select_waiters(&self.0.select_waiters, selected);
     }
 
-    pub fn complete_recv(&self) -> Result<T, RecvError> {
+    pub(crate) fn complete_recv(&self) -> Result<T, RecvError> {
         self.recv()
     }
 }
 
 impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Self {
-        self.0.receiver_count.fetch_add(1, AcqRel);
+        // Relaxed is sufficient for a ref-count increment: the Arc::clone below
+        // provides the necessary ordering when the new handle is shared.
+        self.0.receiver_count.fetch_add(1, Relaxed);
         Receiver(Arc::clone(&self.0))
     }
 }
@@ -379,12 +385,36 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        self.0.sender_count.fetch_add(1, Relaxed);
+        Sender(Arc::clone(&self.0))
+    }
+}
+
 impl<T: Send + 'static> crate::SelectableSender for Sender<T> {
     type Input = T;
 
     /// Ready when a receiver is parked (in `recv_waiters`) or all receivers disconnected.
+    ///
+    /// # ⚠ Mutex acquisition in the select try-phase
+    ///
+    /// Unlike every other `SelectableSender::is_ready` implementation in this crate,
+    /// this method acquires the `recv_waiters` `Mutex` to check whether a receiver is
+    /// currently parked.  Rendezvous has no lock-free readiness signal because a send
+    /// can only succeed when a receiver is simultaneously present.
+    ///
+    /// Callers that spin tightly on `is_ready` (e.g. the select try-phase loop) will
+    /// therefore observe brief lock contention.  Use `select!` with a `default` arm or
+    /// a timeout to bound the spin duration.
     fn is_ready(&self) -> bool {
-        !self.0.recv_waiters.lock().unwrap().is_empty() || self.0.receiver_count.load(Acquire) == 0
+        !self
+            .0
+            .recv_waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            || self.0.receiver_count.load(Acquire) == 0
     }
 
     fn register_select(&self, case_id: usize, selected: Arc<AtomicUsize>) {
@@ -396,30 +426,19 @@ impl<T: Send + 'static> crate::SelectableSender for Sender<T> {
         abort_select_waiters(&self.0.send_select_waiters, selected);
     }
 
+    /// Execute the send after winning selection.
+    ///
+    /// NOTE: because `is_ready` fires as soon as one receiver is parked, there is
+    /// a narrow window where that receiver could drop before `complete_send` runs.
+    /// In that case `send()` will park until the *next* receiver arrives rather
+    /// than returning immediately. This is intentional (rendezvous semantics), but
+    /// callers should not assume `complete_send` is non-blocking.
     fn complete_send(&self, value: T) -> Result<(), crate::SendError<T>> {
         self.send(value)
     }
 }
 
-impl<T: Send> crate::SelectableReceiver for Receiver<T> {
-    type Output = T;
-
-    fn is_ready(&self) -> bool {
-        self.is_ready()
-    }
-
-    fn register_select(&self, case_id: usize, selected: Arc<AtomicUsize>) {
-        self.register_select(case_id, selected)
-    }
-
-    fn abort_select(&self, selected: &Arc<AtomicUsize>) {
-        self.abort_select(selected)
-    }
-
-    fn complete(&self) -> Result<Self::Output, RecvError> {
-        self.complete_recv()
-    }
-}
+impl_selectable_receiver!([T: Send] Receiver<T>, T);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Constructor
@@ -453,7 +472,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_basic_rendezvous() {
+    fn basic_rendezvous() {
         let (tx, rx) = channel::<i32>();
         let handle = thread::spawn(move || rx.recv().unwrap());
         // send() blocks until the spawned thread's recv() claims the value.
@@ -462,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_recv_empty() {
+    fn try_recv_empty() {
         let (tx, rx) = channel::<i32>();
         // No sender parked yet.
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
@@ -471,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_recv_wins() {
+    fn try_recv_wins() {
         let (tx, rx) = channel::<i32>();
         // Park a sender in a background thread, then try_recv from main.
         let handle = thread::spawn(move || tx.send(99));
@@ -481,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sender_disconnect_wakes_recv() {
+    fn sender_disconnect_wakes_recv() {
         let (tx, rx) = channel::<i32>();
         let handle = thread::spawn(move || rx.recv());
         thread::sleep(Duration::from_millis(10));
@@ -490,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn test_receiver_disconnect_wakes_sender() {
+    fn receiver_disconnect_wakes_sender() {
         let (tx, rx) = channel::<i32>();
         let handle = thread::spawn(move || tx.send(7));
         thread::sleep(Duration::from_millis(10));
@@ -499,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spsc_stress() {
+    fn spsc_stress() {
         const TOTAL: usize = 256;
 
         let (tx, rx) = channel::<usize>();
@@ -522,14 +541,14 @@ mod tests {
     }
 
     #[test]
-    fn test_try_recv_disconnected_immediately() {
+    fn try_recv_disconnected_immediately() {
         let (tx, rx) = channel::<i32>();
         drop(tx);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
     }
 
     #[test]
-    fn test_rendezvous_select() {
+    fn rendezvous_select() {
         use crate::select;
 
         let (tx, rx) = channel::<i32>();
@@ -545,5 +564,105 @@ mod tests {
                 default(Duration::from_millis(1000)) => break,
             }
         }
+    }
+
+    #[test]
+    fn send_arm_in_select() {
+        // Exercises the SelectableSender impl and Clone for rendezvous::Sender.
+        use crate::select;
+
+        let (tx, rx) = channel::<i32>();
+
+        // Spawn a receiver so the send arm can complete.
+        let handle = thread::spawn(move || rx.recv().unwrap());
+        thread::sleep(Duration::from_millis(20)); // let receiver reach recv()
+
+        select! {
+            send(tx, 77) -> res => assert!(res.is_ok()),
+            default(Duration::from_millis(500)) => panic!("send arm timed out"),
+        }
+
+        assert_eq!(handle.join().unwrap(), 77);
+    }
+
+    #[test]
+    fn concurrent_senders_stress() {
+        // Exercises remove_sender_waiter's CAS traversal with multiple
+        // senders parked simultaneously, some of which get disconnected
+        // before a receiver claims them.
+        const SENDERS: usize = 8;
+        let (tx, rx) = channel::<usize>();
+
+        // Park all senders simultaneously.
+        let mut send_handles = Vec::new();
+        for i in 0..SENDERS {
+            let tx_clone = tx.clone();
+            send_handles.push(thread::spawn(move || tx_clone.send(i)));
+        }
+        drop(tx); // drop original so receiver_count still > 0 but sender set won't keep alive
+
+        // Give all spawned senders time to park on the stack.
+        thread::sleep(Duration::from_millis(30));
+
+        // Consume all parked senders one by one.
+        let mut received = Vec::new();
+        for _ in 0..SENDERS {
+            match rx.recv() {
+                Ok(v) => received.push(v),
+                Err(_) => break,
+            }
+        }
+
+        for h in send_handles {
+            h.join().unwrap().unwrap();
+        }
+
+        received.sort();
+        assert_eq!(received, (0..SENDERS).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn complete_send_after_receiver_drops() {
+        // Regression: complete_send should eventually succeed (with a new receiver)
+        // rather than panic, even if the first receiver disappears between
+        // is_ready() firing and complete_send executing.
+        use crate::select;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (tx, rx) = channel::<i32>();
+        let ready = Arc::new(AtomicBool::new(false));
+
+        // Pre-park a receiver so the send arm sees is_ready() == true.
+        let ready_flag = Arc::clone(&ready);
+        let rx_first = rx.clone();
+        let first_recv = thread::spawn(move || {
+            ready_flag.store(true, Ordering::SeqCst);
+            // This receiver will race with the select's complete_send; it may
+            // take the value first, causing complete_send to wait for rx_second.
+            rx_first.recv()
+        });
+
+        // Wait until the first receiver is parked.
+        while !ready.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(10));
+
+        // Spawn a second receiver that arrives slightly later.
+        let rx_second = rx.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            rx_second.recv()
+        });
+
+        // The send arm will win (is_ready == true) and complete_send will
+        // call send(); it must succeed and deliver 42 to one of the receivers.
+        select! {
+            send(tx, 42) -> res => assert!(res.is_ok()),
+            default(Duration::from_millis(500)) => panic!("send arm timed out"),
+        }
+
+        // The value was delivered to whichever receiver got it.
+        let _ = first_recv.join().unwrap(); // Ok(42) or Disconnected both fine
     }
 }

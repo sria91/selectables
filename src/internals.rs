@@ -1,15 +1,21 @@
 use std::{
     cell::UnsafeCell,
     mem::{ManuallyDrop, MaybeUninit},
+    ptr,
     sync::atomic::{AtomicUsize, Ordering::*},
 };
 
 // ════════════════════════════════════════════════════════════════════════════
 // Channel internals
 // ════════════════════════════════════════════════════════════════════════════
-
-/// Sentinel stored in the shared `selected` atomic when no arm has won yet.
-pub(crate) const UNSELECTED: usize = usize::MAX;
+//
+// Note on structural duplication: bounded_mpmc, bounded_mpsc, unbounded_mpmc,
+// and unbounded_mpsc all share nearly identical `Chan` / `Sender` / `Receiver`
+// scaffolding.  They differ only in the backing queue type (LockFreeBoundedRing
+// vs crossbeam_queue::SegQueue), whether Sender is Clone (MPMC/MPSC), and
+// wake semantics (both-side vs recv-only wakeup).  A future macro or generic
+// abstraction could collapse them, but the duplication is currently kept
+// explicit for readability and to avoid coupling unrelated channel types.
 
 /// Shared lock-free bounded ring buffer used by bounded MPMC/MPSC channels.
 ///
@@ -52,6 +58,11 @@ impl<T> LockFreeBoundedRing<T> {
     }
 
     /// Returns `Err(value)` when the ring is full or capacity is 0.
+    ///
+    /// **Note**: the `Err` path conflates two distinct conditions — "buffer
+    /// full" and "zero-capacity channel" — into the same return value.
+    /// Callers that need to distinguish them must check `self.cap == 0` or
+    /// `self.is_full()` before calling.
     pub(crate) fn try_push(&self, value: T) -> Result<(), T> {
         if self.cap == 0 {
             return Err(value);
@@ -71,9 +82,10 @@ impl<T> LockFreeBoundedRing<T> {
                 {
                     // SAFETY: this producer owns the slot until sequence advance.
                     unsafe {
-                        (*slot.value.get())
-                            .as_mut_ptr()
-                            .copy_from_nonoverlapping(&*value as *const T, 1);
+                        ptr::write(
+                            (*slot.value.get()).as_mut_ptr(),
+                            ptr::read(&*value),
+                        );
                     }
                     slot.sequence.store(pos + 1, Release);
                     return Ok(());
@@ -282,16 +294,48 @@ macro_rules! log_debug {
     };
 }
 
-#[cfg(feature = "debug-logs")]
-macro_rules! log_trace {
-    ($($arg:tt)*) => {
-        log::trace!($($arg)*)
-    };
-}
+/// Generate a boilerplate [`crate::SelectableReceiver`] impl for a channel `Receiver`.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// // Plain receiver with output type T:
+/// impl_selectable_receiver!([T] MyReceiver<T>, T);
+///
+/// // Receiver requiring a bound, e.g. T: Clone:
+/// impl_selectable_receiver!([T: Clone] MyReceiver<T>, T);
+///
+/// // Watch-style receiver whose output type is ():
+/// impl_selectable_receiver!([T] WatchReceiver<T>, ());
+/// ```
+///
+/// The generated impl delegates every method to the receiver's own inherent
+/// methods (`is_ready`, `register_select`, `abort_select`, `complete_recv`),
+/// which must already exist on the type.
+macro_rules! impl_selectable_receiver {
+    ([$($generics:tt)*] $Receiver:ty, $Output:ty) => {
+        impl<$($generics)*> $crate::SelectableReceiver for $Receiver {
+            type Output = $Output;
 
-#[cfg(not(feature = "debug-logs"))]
-macro_rules! log_trace {
-    ($($arg:tt)*) => {
-        ()
+            fn is_ready(&self) -> bool {
+                self.is_ready()
+            }
+
+            fn register_select(
+                &self,
+                case_id: usize,
+                selected: ::std::sync::Arc<::std::sync::atomic::AtomicUsize>,
+            ) {
+                self.register_select(case_id, selected);
+            }
+
+            fn abort_select(&self, selected: &::std::sync::Arc<::std::sync::atomic::AtomicUsize>) {
+                self.abort_select(selected);
+            }
+
+            fn complete(&self) -> ::std::result::Result<Self::Output, $crate::RecvError> {
+                self.complete_recv()
+            }
+        }
     };
 }

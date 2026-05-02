@@ -59,9 +59,10 @@ use crossbeam_queue::SegQueue;
 use crate::{
     error::{RecvError, SendError, TryRecvError},
     waiter::{
-        RecvWaiter, RecvWaiterGuard, RecvWaiterList, SelectWaiter, UNSELECTED,
-        abort_select_waiters, new_recv_waiter_list, push_select_waiter, wake_one_recv_waiter,
-        wake_select_all, wake_select_one,
+        RecvWaiterList, SelectWaiter,
+        abort_select_waiters, drain_select_waiters, new_recv_waiter_list, push_select_waiter,
+        register_plain_recv_waiter, wake_all_recv_waiters, wake_one_recv_waiter, wake_select_all,
+        wake_select_one,
     },
 };
 
@@ -74,7 +75,7 @@ pub(crate) struct Chan<T> {
     queue: SegQueue<T>,
     /// Lock-free waiter stack for simple recv path
     recv_waiters: RecvWaiterList,
-    /// Mutex-protected waiter list for select registration
+    /// Lock-free intrusive stack for select-arm registration.
     select_waiters: Arc<AtomicPtr<SelectWaiter>>,
     /// Number of live `Sender<T>` handles.
     sender_count: AtomicUsize,
@@ -121,13 +122,13 @@ impl<T> Drop for Sender<T> {
             prev - 1
         );
         if prev == 1 {
-            // Last sender dropped — wake all waiting receivers so they can
-            // observe the disconnected state.
+            // Last sender dropped — wake ALL waiting receivers so every blocked
+            // thread can observe the disconnected state (not just one of them).
             log_debug!(
                 "unbounded_mpmc::sender_drop: chan={:p}, disconnecting",
                 Arc::as_ptr(&self.0)
             );
-            wake_one_recv_waiter(&self.0.recv_waiters, UNSELECTED);
+            wake_all_recv_waiters(&self.0.recv_waiters);
             wake_select_all(&self.0.select_waiters);
         }
     }
@@ -135,7 +136,19 @@ impl<T> Drop for Sender<T> {
 
 impl<T> Sender<T> {
     /// Send a value.  An unbounded channel never blocks; this always succeeds.
+    ///
+    /// Returns `Err(SendError(val))` if all receivers have been dropped.
+    ///
+    /// **Note:** `Ok(())` confirms the value was enqueued but does not guarantee
+    /// a receiver is still live — the last receiver may drop concurrently after
+    /// the disconnected check and before the push.  The value will be freed
+    /// when the channel tears down.
     pub fn send(&self, val: T) -> Result<(), SendError<T>> {
+        // Fail-fast: bail if all receivers are gone so the queue doesn't grow
+        // without bound and callers receive accurate error feedback.
+        if self.0.receiver_count.load(Acquire) == 0 {
+            return Err(SendError(val));
+        }
         // ① Push to the lock-free queue.
         // ② Acquire the waiters lock and scan for a receiver to wake.
         //
@@ -149,9 +162,14 @@ impl<T> Sender<T> {
             self.0.queue.len()
         );
 
-        wake_one_recv_waiter(&self.0.recv_waiters, UNSELECTED);
+        wake_one_recv_waiter(&self.0.recv_waiters);
         wake_select_one(&self.0.select_waiters);
         Ok(())
+    }
+
+    /// Returns `true` if all [`Receiver`] handles have been dropped.
+    pub fn is_closed(&self) -> bool {
+        self.0.receiver_count.load(Acquire) == 0
     }
 }
 
@@ -170,7 +188,13 @@ impl<T> Clone for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.0.receiver_count.fetch_sub(1, AcqRel);
+        let prev = self.0.receiver_count.fetch_sub(1, AcqRel);
+        if prev == 1 {
+            // Last receiver dropped — free any Box<SelectWaiter> nodes left on the
+            // select_waiters stack (e.g. from aborted select arms that were never drained
+            // by a sender).
+            drain_select_waiters(&self.0.select_waiters);
+        }
     }
 }
 
@@ -204,9 +228,6 @@ impl<T> Receiver<T> {
     /// Blocking receive.  Parks the calling thread until a message arrives
     /// or all senders are dropped.
     pub fn recv(&self) -> Result<T, RecvError> {
-        // A per-call Arc lets us identify and remove stale waiters after
-        // spurious wakeups without holding any lock during the park.
-        let marker = Arc::new(AtomicUsize::new(UNSELECTED));
         loop {
             // --- fast path (lock-free) ---
             if let Some(v) = self.0.queue.pop() {
@@ -216,34 +237,14 @@ impl<T> Receiver<T> {
                 return Err(RecvError::Disconnected);
             }
 
-            // --- slow path: register waiter on lock-free stack, re-check, park ---
-            // Re-checking closes the lost-wakeup window: if a sender pushed between
-            // the fast-path check above and us pushing onto the stack, we'll find
-            // the item here. Otherwise, the sender will see our entry and wake us.
+            // --- slow path: register waiter, re-check, park ---
+            let _guard = register_plain_recv_waiter(&self.0.recv_waiters);
+
+            // Post-registration re-check: sender may have pushed while we registered.
             if let Some(v) = self.0.queue.pop() {
                 return Ok(v);
             }
             if self.0.sender_count.load(Acquire) == 0 {
-                return Err(RecvError::Disconnected);
-            }
-
-            // Create waiter and push onto lock-free stack
-            let waiter = RecvWaiter::new(usize::MAX, Arc::clone(&marker));
-            let _guard = RecvWaiterGuard::register(waiter, &self.0.recv_waiters);
-
-            // Another check after pushing
-            if let Some(v) = self.0.queue.pop() {
-                return Ok(v);
-            }
-            if self.0.sender_count.load(Acquire) == 0 {
-                return Err(RecvError::Disconnected);
-            }
-
-            // Check if we were already selected (sender beat us)
-            if marker.load(Acquire) != UNSELECTED {
-                if let Some(v) = self.0.queue.pop() {
-                    return Ok(v);
-                }
                 return Err(RecvError::Disconnected);
             }
 
@@ -261,7 +262,7 @@ impl<T> Receiver<T> {
 
     /// Register a select waiter (**registration phase**).
     pub(crate) fn register_select(&self, case_id: usize, selected: Arc<AtomicUsize>) {
-        log_trace!(
+        log_debug!(
             "unbounded_mpmc::register_select: chan={:p}, case_id={}",
             Arc::as_ptr(&self.0),
             case_id
@@ -273,7 +274,7 @@ impl<T> Receiver<T> {
     /// Remove our select waiter (**abort phase**), identified by pointer
     /// equality on the shared `selected` arc.
     pub(crate) fn abort_select(&self, selected: &Arc<AtomicUsize>) {
-        log_trace!(
+        log_debug!(
             "unbounded_mpmc::abort_select: chan={:p}",
             Arc::as_ptr(&self.0)
         );
@@ -285,34 +286,12 @@ impl<T> Receiver<T> {
     /// If another receiver raced ahead and took the item between `select()`
     /// returning and this call, we simply block until the next message — this
     /// is safe for any number of concurrent consumers.
-    pub fn complete_recv(&self) -> Result<T, RecvError> {
+    pub(crate) fn complete_recv(&self) -> Result<T, RecvError> {
         self.recv()
     }
 }
 
-impl<T> crate::SelectableReceiver for Receiver<T> {
-    type Output = T;
-
-    fn is_ready(&self) -> bool {
-        self.is_ready()
-    }
-
-    fn register_select(
-        &self,
-        case_id: usize,
-        selected: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        self.register_select(case_id, selected)
-    }
-
-    fn abort_select(&self, selected: &std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        self.abort_select(selected)
-    }
-
-    fn complete(&self) -> Result<Self::Output, crate::RecvError> {
-        self.complete_recv()
-    }
-}
+impl_selectable_receiver!([T] Receiver<T>, T);
 
 // ════════════════════════════════════════════════════════════════════════════
 // SelectableSender impl for Sender<T>
@@ -344,7 +323,7 @@ impl<T: Send + 'static> crate::SelectableSender for Sender<T> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::thread;
     use std::time::Duration;
 
@@ -398,6 +377,30 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         drop(tx);
         assert_eq!(handle.join().unwrap(), Err(RecvError::Disconnected));
+    }
+
+    #[test]
+    fn all_blocked_receivers_wake_on_last_sender_drop() {
+        // Regression test: previously only one blocked receiver was woken
+        // when the last sender dropped, leaving the rest parked forever.
+        const N: usize = 8;
+        let (tx, rx) = channel::<i32>();
+        let barrier = Arc::new(std::sync::Barrier::new(N + 1));
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let rx_clone = rx.clone();
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                b.wait(); // synchronise so all receivers park before drop
+                rx_clone.recv()
+            }));
+        }
+        barrier.wait();
+        thread::sleep(Duration::from_millis(20)); // let all threads reach park
+        drop(tx);
+        for h in handles {
+            assert_eq!(h.join().unwrap(), Err(RecvError::Disconnected));
+        }
     }
 
     // ── Multi-sender / multi-receiver ─────────────────────────────────────
@@ -475,24 +478,38 @@ mod tests {
             let mut sel = Select::new();
             sel.recv(rx_other.clone());
             let _ = sel.select();
-            start_flag.store(true, Ordering::SeqCst);
-            while !consumed_flag.load(Ordering::SeqCst) {
+            start_flag.store(true, SeqCst);
+            while !consumed_flag.load(SeqCst) {
                 thread::yield_now();
             }
             tx_clone.send(2).unwrap();
             rx_other.complete_recv().unwrap()
         });
 
-        while !started.load(Ordering::SeqCst) {
+        while !started.load(SeqCst) {
             thread::yield_now();
         }
 
         let value = rx.recv().unwrap();
-        consumed.store(true, Ordering::SeqCst);
+        consumed.store(true, SeqCst);
         assert_eq!(value, 1);
 
         let result = handle.join().unwrap();
         assert_eq!(result, 2);
+    }
+
+    // ── disconnect ────────────────────────────────────────────────────────
+
+    #[test]
+    fn send_returns_err_after_all_receivers_drop() {
+        let (tx, rx) = channel::<i32>();
+        let rx2 = rx.clone();
+        drop(rx);
+        // One receiver still alive — send succeeds.
+        assert!(tx.send(1).is_ok());
+        drop(rx2);
+        // All receivers gone — send must return Err and not leak the value.
+        assert!(tx.send(2).is_err());
     }
 
     // ── stress test ───────────────────────────────────────────────────────

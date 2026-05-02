@@ -14,7 +14,7 @@
 //! - `Receiver` can be cloned; all clones share the same value and version counter
 //! - `borrow()` (requires `T: Clone`) returns a clone of the current value
 //! - `borrow_arc()` returns `Option<Arc<T>>` for zero-copy access (no clone needed)
-//! - `changed()` blocks until a new version arrives (version-based, not value-based)
+//! - `changed()` blocks until a new version arrives; returns `Ok(())` on change, `Err` on disconnect
 //! - Only the latest value is stored; intermediate updates are not queued
 //!
 //! # Lock-free reads
@@ -26,17 +26,17 @@
 //!
 //! ```ignore
 //! let (tx, rx) = watch::channel();
-//! tx.send("initial");
+//! tx.send("initial").unwrap();
 //!
-//! let rx1 = rx.clone();
+//! let rx_thread = rx.clone();
 //! std::thread::spawn(move || {
-//!     assert_eq!(*rx.borrow(), Some("initial"));
-//!     rx.changed().ok(); // Wait for next update
-//!     assert_eq!(*rx.borrow(), Some("updated"));
+//!     assert_eq!(rx_thread.borrow(), Some("initial"));
+//!     rx_thread.changed().unwrap(); // Wait for next update
+//!     assert_eq!(rx_thread.borrow(), Some("updated"));
 //! });
 //!
 //! std::thread::sleep(Duration::from_millis(10));
-//! tx.send("updated");
+//! tx.send("updated").unwrap();
 //! ```
 //!
 //! # Zero-copy reads
@@ -45,7 +45,7 @@
 //!
 //! ```ignore
 //! let (tx, rx) = watch::channel();
-//! tx.send(Arc::new(expensive_data));
+//! tx.send(Arc::new(expensive_data)).unwrap();
 //!
 //! if let Some(arc_data) = rx.borrow_arc() {
 //!     // Use arc_data without cloning; multiple threads can share it
@@ -61,7 +61,7 @@
 
 use std::{
     sync::Arc,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering::*},
     thread,
 };
 
@@ -81,13 +81,13 @@ use crate::{
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Create a watch channel for broadcasting value changes.
-/// Returns a sender for updating the value and a receiver for watching changes.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let version = Arc::new(AtomicUsize::new(0));
     let value = Arc::new(ArcSwapOption::empty());
     let recv_waiters = new_recv_waiter_list();
     let select_waiters = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
     let receiver_count = Arc::new(AtomicUsize::new(1));
+    let sender_count = Arc::new(AtomicUsize::new(1));
     log_debug!("watch::channel: created chan={:p}", Arc::as_ptr(&version));
     (
         Sender {
@@ -96,41 +96,23 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
             recv_waiters: Arc::clone(&recv_waiters),
             select_waiters: Arc::clone(&select_waiters),
             receiver_count: Arc::clone(&receiver_count),
+            sender_count: Arc::clone(&sender_count),
         },
         Receiver {
             version,
             value,
             recv_waiters,
             select_waiters,
-            wait_version: Arc::new(AtomicUsize::new(0)),
-            wait_armed: Arc::new(AtomicBool::new(false)),
+            cursor_version: AtomicUsize::new(0),
+            cursor_armed: AtomicBool::new(false),
             receiver_count,
+            sender_count,
         },
     )
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Watch borrow guard
-// ════════════════════════════════════════════════════════════════════════════
-
-pub struct Ref<T> {
-    snapshot: Option<T>,
-}
-
-impl<T> std::ops::Deref for Ref<T> {
-    type Target = Option<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.snapshot
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// Watch channel internals
-// ════════════════════════════════════════════════════════════════════════════
-
-// ════════════════════════════════════════════════════════════════════════════
-// WatchSender<T>
+// Sender<T>
 // ════════════════════════════════════════════════════════════════════════════
 
 pub struct Sender<T> {
@@ -139,6 +121,7 @@ pub struct Sender<T> {
     recv_waiters: RecvWaiterList,
     select_waiters: Arc<AtomicPtr<SelectWaiter>>,
     receiver_count: Arc<AtomicUsize>,
+    sender_count: Arc<AtomicUsize>,
 }
 
 impl<T> Sender<T> {
@@ -146,34 +129,16 @@ impl<T> Sender<T> {
     ///
     /// Returns `Err(SendError(value))` if all receivers have been dropped,
     /// giving ownership of the value back to the caller.
+    ///
+    /// Note: a successful `Ok(())` does not guarantee any receiver is still
+    /// alive to observe the value — the last receiver may drop concurrently
+    /// after the disconnected check but before the value is stored.
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
-        if self.receiver_count.load(Ordering::Acquire) == 0 {
+        if self.receiver_count.load(Acquire) == 0 {
             return Err(SendError(value));
         }
-
-        #[cfg(feature = "debug-logs")]
-        let chan_id = Arc::as_ptr(&self.version);
-        #[cfg(feature = "debug-logs")]
-        let old_version = self.version.load(Ordering::SeqCst);
-
-        // Publish value then advance version atomically (SeqCst ensures ordering).
         self.value.store(Some(Arc::new(value)));
-        #[cfg_attr(not(feature = "debug-logs"), allow(unused_variables))]
-        let new_version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
-        #[cfg(feature = "debug-logs")]
-        log_debug!(
-            "watch::send: chan={:p}, version={} -> {}",
-            chan_id,
-            old_version,
-            new_version,
-        );
-
-        // Wake all lock-free recv waiters
-        wake_all_recv_waiters(&self.recv_waiters, UNSELECTED);
-
-        // Wake all select waiters (lock-free, frees nodes)
-        wake_select_all(&self.select_waiters);
-
+        self.bump_version_and_notify();
         Ok(())
     }
 
@@ -185,49 +150,70 @@ impl<T> Sender<T> {
     ///
     /// Returns `Err(SendError(()))` if all receivers have been dropped.
     pub fn mark_changed(&self) -> Result<(), SendError<()>> {
-        if self.receiver_count.load(Ordering::Acquire) == 0 {
+        if self.receiver_count.load(Acquire) == 0 {
             return Err(SendError(()));
         }
-
-        #[cfg(feature = "debug-logs")]
-        let chan_id = Arc::as_ptr(&self.version);
-        #[cfg(feature = "debug-logs")]
-        let old_version = self.version.load(Ordering::SeqCst);
-
-        // Advance version without touching the stored value.
-        #[cfg_attr(not(feature = "debug-logs"), allow(unused_variables))]
-        let new_version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
-        #[cfg(feature = "debug-logs")]
-        log_debug!(
-            "watch::mark_changed: chan={:p}, version={} -> {}",
-            chan_id,
-            old_version,
-            new_version,
-        );
-
-        // Wake all lock-free recv waiters
-        wake_all_recv_waiters(&self.recv_waiters, UNSELECTED);
-
-        // Wake all select waiters (lock-free, frees nodes)
-        wake_select_all(&self.select_waiters);
-
+        self.bump_version_and_notify();
         Ok(())
     }
 
     /// Check if all receivers have been dropped.
     pub fn is_closed(&self) -> bool {
-        self.receiver_count.load(Ordering::Acquire) == 0
+        self.receiver_count.load(Acquire) == 0
+    }
+
+    /// Advance the version counter and wake all blocked receivers and select arms.
+    ///
+    /// `Release` ordering pairs with `Acquire` loads in receivers so the new
+    /// value (if any) is visible before the version bump is observed.
+    fn bump_version_and_notify(&self) {
+        #[cfg(feature = "debug-logs")]
+        let chan_id = Arc::as_ptr(&self.version);
+        #[cfg(feature = "debug-logs")]
+        let old_version = self.version.load(Relaxed);
+        #[cfg_attr(not(feature = "debug-logs"), allow(unused_variables))]
+        let new_version = self.version.fetch_add(1, Release) + 1;
+        #[cfg(feature = "debug-logs")]
+        log_debug!(
+            "watch::bump_version: chan={:p}, version={} -> {}",
+            chan_id,
+            old_version,
+            new_version,
+        );
+        self.wake_all();
+    }
+
+    /// Wake all waiting receivers and select arms without bumping the version.
+    ///
+    /// Used by both `bump_version_and_notify` (after a version change) and
+    /// `Drop` (to unblock receivers waiting on a now-gone sender).
+    fn wake_all(&self) {
+        wake_all_recv_waiters(&self.recv_waiters);
+        wake_select_all(&self.select_waiters);
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        let prev = self.sender_count.fetch_sub(1, AcqRel);
+        if prev == 1 {
+            // Last sender dropped — wake all waiting receivers so they can
+            // observe the disconnected state.
+            self.wake_all();
+        }
     }
 }
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
+        self.sender_count.fetch_add(1, Relaxed);
         Sender {
             version: Arc::clone(&self.version),
             value: Arc::clone(&self.value),
             recv_waiters: Arc::clone(&self.recv_waiters),
             select_waiters: Arc::clone(&self.select_waiters),
             receiver_count: Arc::clone(&self.receiver_count),
+            sender_count: Arc::clone(&self.sender_count),
         }
     }
 }
@@ -251,7 +237,7 @@ impl<T: Send + 'static> crate::SelectableSender for Sender<T> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// WatchReceiver<T>
+// Receiver<T>
 // ════════════════════════════════════════════════════════════════════════════
 
 pub struct Receiver<T> {
@@ -259,14 +245,16 @@ pub struct Receiver<T> {
     value: Arc<ArcSwapOption<T>>,
     recv_waiters: RecvWaiterList,
     select_waiters: Arc<AtomicPtr<SelectWaiter>>,
-    wait_version: Arc<AtomicUsize>,
-    wait_armed: Arc<AtomicBool>,
+    // Per-receiver cursor: not shared across clones, so no Arc needed.
+    cursor_version: AtomicUsize,
+    cursor_armed: AtomicBool,
     receiver_count: Arc<AtomicUsize>,
+    sender_count: Arc<AtomicUsize>,
 }
 
 impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Self {
-        self.receiver_count.fetch_add(1, Ordering::Relaxed);
+        self.receiver_count.fetch_add(1, Relaxed);
         Receiver {
             version: Arc::clone(&self.version),
             value: Arc::clone(&self.value),
@@ -274,27 +262,34 @@ impl<T> Clone for Receiver<T> {
             select_waiters: Arc::clone(&self.select_waiters),
             // Each clone gets its own independent cursor so that one receiver
             // consuming a notification does not suppress it for sibling clones.
-            wait_version: Arc::new(AtomicUsize::new(
-                self.wait_version.load(Ordering::SeqCst),
-            )),
-            wait_armed: Arc::new(AtomicBool::new(
-                self.wait_armed.load(Ordering::SeqCst),
-            )),
+            cursor_version: AtomicUsize::new(self.cursor_version.load(Relaxed)),
+            cursor_armed: AtomicBool::new(self.cursor_armed.load(Relaxed)),
             receiver_count: Arc::clone(&self.receiver_count),
+            sender_count: Arc::clone(&self.sender_count),
         }
     }
 }
 
 impl<T> Receiver<T> {
-    fn snapshot_wait_version(&self) -> Result<usize, RecvError> {
-        if Arc::strong_count(&self.version) == 1 {
-            self.wait_armed.store(false, Ordering::SeqCst);
-            return Err(RecvError::Disconnected);
+    /// Arm the per-receiver cursor at the current channel version if not already armed.
+    ///
+    /// Returns the current (live) channel version in all cases.
+    ///
+    /// - **First call / unarmed**: stores the live version into `cursor_version` and sets
+    ///   `cursor_armed`, establishing a change baseline.
+    /// - **Already armed**: leaves `cursor_version` untouched and returns the fresh live
+    ///   version. Callers can compare the return value against `cursor_version` to detect
+    ///   whether a change has occurred since the cursor was last armed.
+    ///
+    /// The cursor is disarmed (reset to unarmed) when a change is consumed via
+    /// `await_change_from` returning `Ok`.
+    fn arm_cursor(&self) -> usize {
+        let cur = self.version.load(Acquire);
+        if !self.cursor_armed.load(Relaxed) {
+            self.cursor_version.store(cur, Relaxed);
+            self.cursor_armed.store(true, Relaxed);
         }
-        let v = self.version.load(Ordering::SeqCst);
-        self.wait_version.store(v, Ordering::SeqCst);
-        self.wait_armed.store(true, Ordering::SeqCst);
-        Ok(v)
+        cur
     }
 
     fn await_change_from(&self, baseline: usize) -> Result<usize, RecvError> {
@@ -303,10 +298,10 @@ impl<T> Receiver<T> {
         let sel = Arc::new(AtomicUsize::new(UNSELECTED));
 
         loop {
-            let cur = self.version.load(Ordering::SeqCst);
+            let cur = self.version.load(Acquire);
             if cur != baseline {
-                self.wait_version.store(cur, Ordering::SeqCst);
-                self.wait_armed.store(false, Ordering::SeqCst);
+                self.cursor_version.store(cur, Relaxed);
+                self.cursor_armed.store(false, Relaxed);
                 #[cfg(feature = "debug-logs")]
                 log_debug!(
                     "watch::await_change_from: chan={:p}, observed version={} -> {}",
@@ -316,8 +311,8 @@ impl<T> Receiver<T> {
                 );
                 return Ok(cur);
             }
-            if Arc::strong_count(&self.version) == 1 {
-                self.wait_armed.store(false, Ordering::SeqCst);
+            if self.sender_count.load(Acquire) == 0 {
+                self.cursor_armed.store(false, Relaxed);
                 #[cfg(feature = "debug-logs")]
                 log_debug!(
                     "watch::await_change_from: chan={:p}, disconnected while waiting",
@@ -326,7 +321,10 @@ impl<T> Receiver<T> {
                 return Err(RecvError::Disconnected);
             }
 
-            // Register on lock-free stack for simple recv blocking
+            // `sel` is declared above the loop so the Arc allocation happens
+            // once; we clone it per iteration because RecvWaiter takes
+            // ownership and the guard drops at loop-bottom, deregistering the
+            // waiter before we park. The clone is a cheap refcount bump.
             let waiter = RecvWaiter::new(0, Arc::clone(&sel));
             let _guard = RecvWaiterGuard::register(waiter, &self.recv_waiters);
             #[cfg(feature = "debug-logs")]
@@ -335,7 +333,11 @@ impl<T> Receiver<T> {
                 state_id,
                 baseline
             );
-            thread::park_timeout(std::time::Duration::from_secs(1));
+            // Re-check after registering to close the lost-wakeup window.
+            if self.version.load(Acquire) != baseline || self.sender_count.load(Acquire) == 0 {
+                continue;
+            }
+            thread::park();
         }
     }
 
@@ -346,68 +348,80 @@ impl<T> Receiver<T> {
 
     /// Borrow the current value, if any.
     ///
-    /// This remains ergonomic for `*rx.borrow()` style call sites by cloning
-    /// from the lockless `ArcSwapOption` snapshot.
-    pub fn borrow(&self) -> Ref<T>
+    /// Returns a clone of the currently stored value via the lock-free `ArcSwapOption`.
+    pub fn borrow(&self) -> Option<T>
     where
         T: Clone,
     {
         #[cfg(feature = "debug-logs")]
         let state_id = Arc::as_ptr(&self.version);
         #[cfg(feature = "debug-logs")]
-        let version = self.version.load(Ordering::SeqCst);
+        let version = self.version.load(Relaxed);
         let snapshot = self.borrow_arc().as_deref().cloned();
         #[cfg(feature = "debug-logs")]
         log_debug!("watch::borrow: chan={:p}, version={}", state_id, version);
-        Ref { snapshot }
+        snapshot
     }
 
-    /// Wait for a change in the value.
-    /// Returns the new version number.
-    pub fn changed(&self) -> Result<usize, RecvError> {
+    /// Returns `true` if all [`Sender`] handles have been dropped.
+    pub fn is_closed(&self) -> bool {
+        self.sender_count.load(Acquire) == 0
+    }
+
+    /// Wait until the value changes.
+    ///
+    /// Blocks until a new version is published or all senders are dropped.
+    /// Returns `Ok(())` on a successful change, `Err(RecvError::Disconnected)`
+    /// if all senders have been dropped.
+    ///
+    /// **Baseline semantics**: `changed()` always uses the *live* channel version as
+    /// its change baseline (via `arm_cursor`). If the cursor was previously armed by
+    /// an `is_ready()` call, any version change that occurred between that arming and
+    /// this call will be skipped — use `complete_recv()` to consume a change that
+    /// was already observed by `is_ready()`.
+    pub fn changed(&self) -> Result<(), RecvError> {
         #[cfg(feature = "debug-logs")]
         let state_id = Arc::as_ptr(&self.version);
-        let current_version = self.snapshot_wait_version()?;
+        if self.sender_count.load(Acquire) == 0 {
+            self.cursor_armed.store(false, Relaxed);
+            return Err(RecvError::Disconnected);
+        }
+        // arm_cursor() returns the live channel version. Whether or not the
+        // cursor was previously armed, we pass this live version as the
+        // baseline: await_change_from blocks until the version exceeds it.
+        // Any changes that occurred between a prior is_ready() arming and
+        // this call are therefore skipped; use complete_recv() instead
+        // to consume a change already observed by is_ready().
+        let current_version = self.arm_cursor();
         #[cfg(feature = "debug-logs")]
         log_debug!(
             "watch::changed: chan={:p}, current_version={}",
             state_id,
             current_version
         );
-
-        self.await_change_from(current_version)
+        self.await_change_from(current_version).map(|_| ())
     }
 
     // ── Hooks for select! integration ─────────────────────────────
 
     /// True if the value has changed since last check.
     pub(crate) fn is_ready(&self) -> bool {
-        if Arc::strong_count(&self.version) == 1 {
+        if self.sender_count.load(Acquire) == 0 {
             return true;
         }
-        let cur = self.version.load(Ordering::SeqCst);
-        if !self.wait_armed.load(Ordering::SeqCst) {
-            self.wait_version.store(cur, Ordering::SeqCst);
-            self.wait_armed.store(true, Ordering::SeqCst);
-            return false;
-        }
-        cur != self.wait_version.load(Ordering::SeqCst)
+        let cur = self.arm_cursor();
+        cur != self.cursor_version.load(Relaxed)
     }
 
     /// Register a select waiter.
     pub(crate) fn register_select(&self, case_id: usize, selected: Arc<AtomicUsize>) {
-        log_trace!(
+        log_debug!(
             "watch::register_select: chan={:p}, case_id={}",
             Arc::as_ptr(&self.version),
             case_id
         );
-        let cur = self.version.load(Ordering::SeqCst);
-        if !self.wait_armed.load(Ordering::SeqCst) {
-            self.wait_version.store(cur, Ordering::SeqCst);
-            self.wait_armed.store(true, Ordering::SeqCst);
-        }
-        if Arc::strong_count(&self.version) == 1 || cur != self.wait_version.load(Ordering::SeqCst)
-        {
+        let cur = self.arm_cursor();
+        if self.sender_count.load(Acquire) == 0 || cur != self.cursor_version.load(Relaxed) {
             return;
         }
         let ptr = SelectWaiter::alloc(case_id, selected);
@@ -416,53 +430,27 @@ impl<T> Receiver<T> {
 
     /// Abort select waiter.
     pub(crate) fn abort_select(&self, selected: &Arc<AtomicUsize>) {
-        log_trace!("watch::abort_select: chan={:p}", Arc::as_ptr(&self.version));
+        log_debug!("watch::abort_select: chan={:p}", Arc::as_ptr(&self.version));
         abort_select_waiters(&self.select_waiters, selected);
     }
 
-    /// Complete the select operation.
-    pub fn complete_changed(&self) -> Result<usize, RecvError> {
-        // Use the stored wait_version as the baseline directly.
-        // The select! macro calls complete() on the *original* receiver (not the
-        // armed clone stored in Select), so we cannot rely on wait_armed being
-        // set. Using wait_version (which defaults to 0) as the baseline means we
-        // return immediately if any version > baseline already exists.
-        let baseline = self.wait_version.load(Ordering::SeqCst);
-        self.await_change_from(baseline)
+    /// Complete the select operation: block until the version seen by `is_ready()`
+    /// is consumed, then reset the cursor.
+    pub(crate) fn complete_recv(&self) -> Result<(), RecvError> {
+        let baseline = self.cursor_version.load(Relaxed);
+        self.await_change_from(baseline).map(|_| ())
     }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        if self.receiver_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.receiver_count.fetch_sub(1, AcqRel) == 1 {
             drain_select_waiters(&self.select_waiters);
         }
     }
 }
 
-impl<T> crate::SelectableReceiver for Receiver<T> {
-    type Output = usize;
-
-    fn is_ready(&self) -> bool {
-        self.is_ready()
-    }
-
-    fn register_select(
-        &self,
-        case_id: usize,
-        selected: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        self.register_select(case_id, selected)
-    }
-
-    fn abort_select(&self, selected: &std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        self.abort_select(selected)
-    }
-
-    fn complete(&self) -> Result<Self::Output, crate::RecvError> {
-        self.complete_changed()
-    }
-}
+impl_selectable_receiver!([T] Receiver<T>, ());
 
 #[cfg(test)]
 mod tests {
@@ -476,12 +464,12 @@ mod tests {
         assert!(rx.borrow().is_none());
 
         tx.send(42).unwrap();
-        assert_eq!(*rx.borrow(), Some(42));
+        assert_eq!(rx.borrow(), Some(42));
 
         let rx2 = rx.clone();
         tx.send(100).unwrap();
-        assert_eq!(*rx.borrow(), Some(100));
-        assert_eq!(*rx2.borrow(), Some(100));
+        assert_eq!(rx.borrow(), Some(100));
+        assert_eq!(rx2.borrow(), Some(100));
     }
 
     #[test]
@@ -490,7 +478,7 @@ mod tests {
         tx.send(1).unwrap();
 
         let handle = thread::spawn(move || {
-            assert_eq!(rx.changed().unwrap(), 2);
+            rx.changed().unwrap();
             rx.borrow().unwrap()
         });
 
@@ -510,7 +498,7 @@ mod tests {
         // is_ready() arms each receiver at the current version (establishes
         // baseline); returns false because no new change has occurred since
         // arming. The two cursors are independent.
-        assert!(!rx.is_ready());    // arms rx at version 1
+        assert!(!rx.is_ready()); // arms rx at version 1
         assert!(!clone.is_ready()); // arms clone at version 1, independently
 
         tx.send(2).unwrap(); // version = 2
@@ -520,13 +508,13 @@ mod tests {
         assert!(clone.is_ready());
 
         // Completing via rx advances only rx's cursor, not clone's.
-        assert_eq!(rx.complete_changed(), Ok(2));
-        assert!(!rx.is_ready());   // rx cursor now at 2
+        assert_eq!(rx.complete_recv(), Ok(()));
+        assert!(!rx.is_ready()); // rx cursor now at 2
         assert!(clone.is_ready()); // clone cursor still at 1 < 2
 
         tx.send(3).unwrap();
         assert!(rx.is_ready());
-        assert_eq!(rx.complete_changed(), Ok(3));
+        assert_eq!(rx.complete_recv(), Ok(()));
     }
 
     #[test]
@@ -536,6 +524,15 @@ mod tests {
         drop(rx);
         assert!(tx.is_closed());
         assert_eq!(tx.send(42), Err(SendError(42)));
+    }
+
+    #[test]
+    fn mark_changed_returns_err_when_no_receivers_no_value() {
+        // Verify mark_changed() returns Err even when no value has ever been
+        // stored — guards against any future code assuming a value exists.
+        let (tx, rx) = channel::<i32>();
+        drop(rx);
+        assert_eq!(tx.mark_changed(), Err(SendError(())));
     }
 
     #[test]
@@ -554,7 +551,7 @@ mod tests {
 
         // Thread wakes and the value is still "initial" — not updated
         assert_eq!(handle.join().unwrap(), Some("initial"));
-        assert_eq!(*rx.borrow(), Some("initial"));
+        assert_eq!(rx.borrow(), Some("initial"));
 
         // Returns Err when all receivers dropped
         drop(rx);
@@ -569,17 +566,17 @@ mod tests {
         let rx2 = rx1.clone();
         let rx3 = rx1.clone();
 
-        let h1 = thread::spawn(move || rx1.changed().unwrap());
-        let h2 = thread::spawn(move || rx2.changed().unwrap());
-        let h3 = thread::spawn(move || rx3.changed().unwrap());
+        let h1 = thread::spawn(move || rx1.changed());
+        let h2 = thread::spawn(move || rx2.changed());
+        let h3 = thread::spawn(move || rx3.changed());
 
         thread::sleep(Duration::from_millis(20));
         tx.send(1).unwrap();
 
-        // All three should wake and return version 2 (second send).
-        assert_eq!(h1.join().unwrap(), 2);
-        assert_eq!(h2.join().unwrap(), 2);
-        assert_eq!(h3.join().unwrap(), 2);
+        // All three should wake with Ok(()).
+        assert_eq!(h1.join().unwrap(), Ok(()));
+        assert_eq!(h2.join().unwrap(), Ok(()));
+        assert_eq!(h3.join().unwrap(), Ok(()));
     }
 
     #[test]
@@ -597,7 +594,44 @@ mod tests {
     }
 
     #[test]
+    fn multi_receiver_all_detect_sender_disconnect() {
+        // Regression test: with Arc::strong_count-based detection, cloned
+        // receivers never observed Disconnected when the sender dropped.
+        const N: usize = 4;
+        let (tx, rx) = channel::<i32>();
+        tx.send(0).unwrap(); // establish a baseline version
+
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let rx_clone = rx.clone();
+            handles.push(thread::spawn(move || rx_clone.changed()));
+        }
+
+        thread::sleep(Duration::from_millis(20)); // let all threads reach park
+        drop(tx);
+
+        for h in handles {
+            assert_eq!(
+                h.join().unwrap(),
+                Err(crate::error::RecvError::Disconnected)
+            );
+        }
+    }
+
+    #[test]
     fn borrow_reflects_latest_send_immediately() {
+        let (tx, rx) = channel::<i32>();
+        assert!(rx.borrow().is_none());
+
+        tx.send(7).unwrap();
+        assert_eq!(rx.borrow(), Some(7));
+
+        tx.send(8).unwrap();
+        assert_eq!(rx.borrow(), Some(8));
+    }
+
+    #[test]
+    fn borrow_arc_reflects_latest_send_immediately() {
         let (tx, rx) = channel::<i32>();
         assert!(rx.borrow_arc().is_none());
 
@@ -609,13 +643,24 @@ mod tests {
     }
 
     #[test]
+    fn is_closed_reflects_sender_liveness() {
+        let (tx, rx) = channel::<i32>();
+        assert!(!rx.is_closed());
+        let tx2 = tx.clone();
+        drop(tx);
+        assert!(!rx.is_closed()); // tx2 still alive
+        drop(tx2);
+        assert!(rx.is_closed());
+    }
+
+    #[test]
     fn rapid_sends_borrow_shows_latest() {
         let (tx, rx) = channel::<u32>();
         for i in 0..100u32 {
             tx.send(i).unwrap();
         }
         // borrow() returns the most recently sent value.
-        assert_eq!(*rx.borrow_arc().unwrap(), 99);
+        assert_eq!(rx.borrow(), Some(99));
     }
 
     #[test]
@@ -632,8 +677,39 @@ mod tests {
 
         // Blocking select: fires when watch version changes.
         select! {
-            recv(rx) -> ver => assert_eq!(ver, Ok(2)),
+            recv(rx) -> res => assert_eq!(res, Ok(())),
             default(Duration::from_millis(200)) => panic!("timeout"),
         }
+    }
+
+    #[test]
+    fn multiple_senders_last_write_wins() {
+        // All senders share the same ArcSwapOption; only the latest send is visible.
+        let (tx1, rx) = channel::<i32>();
+        let tx2 = tx1.clone();
+
+        tx1.send(10).unwrap();
+        tx2.send(20).unwrap();
+
+        // Last write wins; only 20 is visible.
+        assert_eq!(rx.borrow(), Some(20));
+    }
+
+    #[test]
+    fn sender_clone_extends_liveness() {
+        let (tx1, rx) = channel::<i32>();
+        let tx2 = tx1.clone();
+
+        drop(tx1);
+        // rx should not observe disconnect yet — tx2 is still alive.
+        assert!(!rx.is_closed());
+        assert!(!tx2.is_closed());
+
+        tx2.send(42).unwrap();
+        assert_eq!(rx.borrow(), Some(42));
+
+        drop(tx2);
+        assert!(rx.is_closed());
+        assert_eq!(rx.changed(), Err(crate::error::RecvError::Disconnected));
     }
 }
