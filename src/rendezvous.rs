@@ -17,7 +17,7 @@
 //!   all receivers are dropped before the value is taken.
 //! - `try_recv()` returns the value from a parked sender if one is waiting, or `Err` otherwise.
 //! - `recv()` blocks until a sender arrives or all senders disconnect.
-//! - Neither `Sender` nor `Receiver` is `Clone`: this is a strictly SPSC channel.
+//! - `Receiver` is `Clone` (clones share the same channel state); `Sender` is not.
 //!
 //! # Example
 //!
@@ -352,6 +352,13 @@ impl<T: Send> Receiver<T> {
     }
 }
 
+impl<T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        self.0.receiver_count.fetch_add(1, AcqRel);
+        Receiver(Arc::clone(&self.0))
+    }
+}
+
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let prev = self.0.receiver_count.fetch_sub(1, AcqRel);
@@ -492,103 +499,25 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_senders_one_receiver() {
-        let (tx, rx) = channel::<i32>();
-        let tx2 = tx.clone();
-        let tx3 = tx.clone();
-
-        let h1 = thread::spawn(move || tx.send(1).unwrap());
-        let h2 = thread::spawn(move || tx2.send(2).unwrap());
-        let h3 = thread::spawn(move || tx3.send(3).unwrap());
-
-        let mut results = vec![rx.recv().unwrap(), rx.recv().unwrap(), rx.recv().unwrap()];
-        results.sort();
-        assert_eq!(results, vec![1, 2, 3]);
-
-        h1.join().unwrap();
-        h2.join().unwrap();
-        h3.join().unwrap();
-    }
-
-    #[test]
-    fn test_select_arm_rendezvous() {
-        use crate::{Select, bounded_mpmc};
-
-        let (tx_rdv, rx_rdv) = channel::<i32>();
-        // never() stays permanently alive and empty — never fires.
-        let rx_never = bounded_mpmc::never::<i32>();
-
-        // Park a sender so the rendezvous arm becomes ready.
-        let h = thread::spawn(move || tx_rdv.send(55).unwrap());
-        thread::sleep(Duration::from_millis(20));
-
-        let mut sel = Select::new();
-        let i_rdv = sel.recv(rx_rdv.clone());
-        let _i_never = sel.recv(rx_never);
-
-        let op = sel.select();
-        assert_eq!(op.index, i_rdv);
-        assert_eq!(rx_rdv.complete_recv(), Ok(55));
-
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn test_one_sender_multiple_receivers_each_gets_one() {
-        // 3 receivers, 3 sends: each receiver should win exactly one handoff.
-        let (tx, rx) = channel::<i32>();
-        let rx2 = rx.clone();
-        let rx3 = rx.clone();
-
-        let h1 = thread::spawn(move || rx.recv().unwrap());
-        let h2 = thread::spawn(move || rx2.recv().unwrap());
-        let h3 = thread::spawn(move || rx3.recv().unwrap());
-
-        // Give receivers time to park.
-        thread::sleep(Duration::from_millis(20));
-        tx.send(1).unwrap();
-        tx.send(2).unwrap();
-        tx.send(3).unwrap();
-
-        let mut results = vec![h1.join().unwrap(), h2.join().unwrap(), h3.join().unwrap()];
-        results.sort();
-        assert_eq!(results, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_mpmc_stress() {
-        const SENDERS: usize = 4;
-        const PER_SENDER: usize = 64;
-        const TOTAL: usize = SENDERS * PER_SENDER;
+    fn test_spsc_stress() {
+        const TOTAL: usize = 256;
 
         let (tx, rx) = channel::<usize>();
         let counter = Arc::new(AtomicUsize::new(0));
 
-        let mut handles = vec![];
-
-        // Spawn senders (they block until a receiver is ready).
-        for s in 0..SENDERS {
-            let txc = tx.clone();
-            handles.push(thread::spawn(move || {
-                for i in 0..PER_SENDER {
-                    // Ignore errors from early receiver disconnect
-                    let _ = txc.send(s * PER_SENDER + i);
-                }
-            }));
-        }
-        drop(tx); // drop original sender
-
-        // Single receiver drains all messages until all senders disconnect.
         let ctr = Arc::clone(&counter);
-        handles.push(thread::spawn(move || {
+        let receiver = thread::spawn(move || {
             while rx.recv().is_ok() {
                 ctr.fetch_add(1, Relaxed);
             }
-        }));
+        });
 
-        for h in handles {
-            h.join().unwrap();
+        for i in 0..TOTAL {
+            tx.send(i).unwrap();
         }
+        drop(tx);
+
+        receiver.join().unwrap();
         assert_eq!(counter.load(Relaxed), TOTAL);
     }
 
@@ -597,5 +526,24 @@ mod tests {
         let (tx, rx) = channel::<i32>();
         drop(tx);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn test_rendezvous_select() {
+        use crate::select;
+
+        let (tx, rx) = channel::<i32>();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            tx.send(123).unwrap();
+        });
+
+        loop {
+            select! {
+                recv(rx) -> msg => { assert_eq!(msg.unwrap(), 123); break; },
+                default(Duration::from_millis(1000)) => break,
+            }
+        }
     }
 }

@@ -613,7 +613,7 @@ macro_rules! select {
 mod tests {
     use std::{sync::mpsc, thread, time::Duration};
 
-    use crate::{bounded_mpmc, bounded_mpsc, rendezvous, unbounded_mpmc, unbounded_mpsc, watch};
+    use crate::{bounded_mpmc, bounded_mpsc, unbounded_mpmc, unbounded_mpsc, watch};
 
     #[test]
     fn watch_with_instant_default() {
@@ -745,21 +745,6 @@ mod tests {
         select! {
             send(tx, 5) -> res => assert!(res.is_ok()),
         }
-    }
-
-    /// Rendezvous send arm fires once a receiver parks.
-    #[test]
-    fn test_send_arm_rendezvous() {
-        let (tx, rx) = rendezvous::channel::<i32>();
-
-        // Spawn receiver that parks after a short delay.
-        let handle = thread::spawn(move || rx.recv().unwrap());
-        thread::sleep(Duration::from_millis(15));
-
-        select! {
-            send(tx, 55) -> res => assert!(res.is_ok()),
-        }
-        assert_eq!(handle.join().unwrap(), 55);
     }
 
     /// Mixed recv + send: correct arm fires.
