@@ -17,7 +17,7 @@
 //!   all receivers are dropped before the value is taken.
 //! - `try_recv()` returns the value from a parked sender if one is waiting, or `Err` otherwise.
 //! - `recv()` blocks until a sender arrives or all senders disconnect.
-//! - Both `Sender` and `Receiver` are `Clone` (MPMC semantics).
+//! - Neither `Sender` nor `Receiver` is `Clone`: this is a strictly SPSC channel.
 //!
 //! # Example
 //!
@@ -238,13 +238,6 @@ impl<T: Send> Sender<T> {
     }
 }
 
-impl<T> Clone for Sender<T> {
-    fn clone(&self) -> Self {
-        self.0.sender_count.fetch_add(1, Relaxed);
-        Sender(Arc::clone(&self.0))
-    }
-}
-
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let prev = self.0.sender_count.fetch_sub(1, AcqRel);
@@ -356,13 +349,6 @@ impl<T: Send> Receiver<T> {
 
     pub fn complete_recv(&self) -> Result<T, RecvError> {
         self.recv()
-    }
-}
-
-impl<T> Clone for Receiver<T> {
-    fn clone(&self) -> Self {
-        self.0.receiver_count.fetch_add(1, Relaxed);
-        Receiver(Arc::clone(&self.0))
     }
 }
 
