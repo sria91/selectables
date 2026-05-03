@@ -5,7 +5,7 @@ authors = [
     "GitHub Copilot <copilot@github.com>",
     "Anthropic Claude <claude@anthropic.com>",
 ]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Lock-free channels with a unified select! macro for recv and send arms"
 readme = "README.md"

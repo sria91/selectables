@@ -26,7 +26,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use std::time::Duration;
 //! use selectables::{interval::interval, unbounded_mpmc, select};
 //!

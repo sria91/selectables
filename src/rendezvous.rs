@@ -17,11 +17,11 @@
 //!   all receivers are dropped before the value is taken.
 //! - `try_recv()` returns the value from a parked sender if one is waiting, or `Err` otherwise.
 //! - `recv()` blocks until a sender arrives or all senders disconnect.
-//! - `Receiver` is `Clone` (clones share the same channel state); `Sender` is not.
+//! - Both `Sender` and `Receiver` are `Clone` (clones share the same channel state).
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
 //! use std::thread;
 //! use selectables::rendezvous;
 //!
@@ -39,7 +39,11 @@
 //!
 //! `Receiver` implements `SelectableReceiver`, so it participates in select arms:
 //!
-//! ```ignore
+//! ```no_run
+//! use std::time::Duration;
+//! use selectables::{select, rendezvous};
+//!
+//! let (_tx, rx) = rendezvous::channel::<i32>();
 //! select! {
 //!     recv(rx) -> msg => println!("Got: {:?}", msg),
 //!     default(Duration::from_millis(10)) => println!("timeout"),
@@ -193,6 +197,24 @@ impl<T: Send> Sender<T> {
 
     /// Remove `ptr` from the sender_waiters stack via CAS traversal.
     /// Called only on the disconnect path when `taken` is still `false`.
+    ///
+    /// # Safety invariant (ABA-freedom)
+    ///
+    /// Each `SenderWaiter` node lives on the **sender thread's stack frame** and its
+    /// address is unique for the duration of the `send()` call.  A concurrent receiver
+    /// can only pop the **head** of the stack via CAS (in `pop_sender`); it never
+    /// traverses interior nodes.  Therefore:
+    ///
+    /// - If `ptr` is the head: we CAS it out atomically.  A concurrent `pop_sender`
+    ///   racing on the same head will fail its CAS and retry, seeing a new head.
+    /// - If `ptr` is interior: we traverse from head to find the predecessor.  Every
+    ///   node we dereference is either (a) still on its sender's stack frame (the
+    ///   sender is parked in `send()` and has not returned), or (b) our own node
+    ///   (`ptr`), which is also on our stack frame.  Receivers only remove the head,
+    ///   so interior nodes cannot be freed while we traverse them.
+    ///
+    /// The LIFO pop-only discipline of `pop_sender` and the stack-pinned lifetime of
+    /// each node together prevent the ABA problem and use-after-free.
     fn remove_sender_waiter(&self, ptr: *mut SenderWaiter<T>) {
         loop {
             let head = self.0.sender_waiters.load(Acquire);
@@ -664,5 +686,42 @@ mod tests {
 
         // The value was delivered to whichever receiver got it.
         let _ = first_recv.join().unwrap(); // Ok(42) or Disconnected both fine
+    }
+
+    #[test]
+    fn stress_concurrent_senders_and_receivers() {
+        // Multiple senders and multiple receivers racing on the same channel.
+        const N: usize = 100;
+        let (tx, rx) = channel::<usize>();
+
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let tx_c = tx.clone();
+            handles.push(thread::spawn(move || tx_c.send(i).unwrap()));
+        }
+        drop(tx);
+
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for _ in 0..4 {
+            let rx_c = rx.clone();
+            let recv = Arc::clone(&received);
+            handles.push(thread::spawn(move || {
+                loop {
+                    match rx_c.recv() {
+                        Ok(v) => recv.lock().unwrap().push(v),
+                        Err(_) => break,
+                    }
+                }
+            }));
+        }
+        drop(rx);
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut vals = received.lock().unwrap().clone();
+        vals.sort();
+        assert_eq!(vals, (0..N).collect::<Vec<_>>());
     }
 }

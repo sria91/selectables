@@ -108,6 +108,9 @@ pub(crate) struct RecvWaiterGuard {
 impl RecvWaiterGuard {
     /// Insert `waiter` into `list` and return a guard that removes it on drop.
     pub(crate) fn register(waiter: Arc<RecvWaiter>, list: &RecvWaiterList) -> Self {
+        // Poisoning is harmless: the waiter list is append/remove-only data and
+        // contains no invariant that a panicking thread could violate. Recovering
+        // the inner Vec via `into_inner` lets the channel keep operating.
         list.lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(Arc::clone(&waiter));

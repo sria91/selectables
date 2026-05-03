@@ -223,6 +223,12 @@ impl<T: Clone> Receiver<T> {
     ///   `Empty` if no new messages have arrived).
     /// - `Err(TryRecvError::Disconnected)` — all senders are gone.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        // Bounded spin count for the mid-publish retry path (seq_after != expected).
+        // If exceeded, the receiver falls back to a Lagged error rather than spinning
+        // infinitely (e.g. if a sender panicked between claiming a sequence number
+        // and publishing the slot).
+        const MAX_SPIN_RETRIES: usize = 1024;
+        let mut spin_count: usize = 0;
         loop {
             let next = self.next_seq.load(Acquire);
             let write = self.chan.write_seq.load(Acquire);
@@ -271,10 +277,20 @@ impl<T: Clone> Receiver<T> {
             if seq_after != expected {
                 // A concurrent sender is mid-publish on this slot (it has
                 // incremented `write_seq` but not yet stored the final `seq`).
-                // We spin here.  **Safety note**: if a sender panics between
-                // `write_seq.fetch_add` and `slot.seq.store`, this spin becomes
-                // infinite.  Callers must guarantee senders do not panic after
-                // claiming a sequence number.
+                // Normally this resolves within a few iterations. If a sender
+                // panicked between `write_seq.fetch_add` and `slot.seq.store`
+                // this spin would be infinite, so we bound the retry count and
+                // fall back to a Lagged error to keep the receiver livelock-free.
+                spin_count += 1;
+                if spin_count > MAX_SPIN_RETRIES {
+                    // Treat the stuck slot as overwritten — advance cursor to
+                    // the oldest available message and report lag.
+                    let write_now = self.chan.write_seq.load(Acquire);
+                    let oldest_now = write_now.saturating_sub(self.chan.cap);
+                    let skipped = oldest_now.saturating_sub(next).max(1);
+                    self.next_seq.store(oldest_now, Release);
+                    return Err(TryRecvError::Lagged { skipped });
+                }
                 std::hint::spin_loop();
                 continue;
             }

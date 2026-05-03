@@ -21,12 +21,12 @@
 //!
 //! # Example: select! macro
 //!
-//! ```ignore
+//! ```no_run
 //! use std::time::Duration;
-//! use selectables::select;
+//! use selectables::{select, unbounded_mpmc, bounded_mpsc};
 //!
-//! let (tx1, rx1) = unbounded_mpmc::channel();
-//! let (tx2, rx2) = bounded_mpsc::channel(4);
+//! let (tx1, rx1) = unbounded_mpmc::channel::<i32>();
+//! let (tx2, rx2) = bounded_mpsc::channel::<i32>(4);
 //!
 //! select! {
 //!     recv(rx1) -> msg => println!("rx1: {:?}", msg),
@@ -838,5 +838,49 @@ mod tests {
         let elapsed = before.elapsed();
         assert!(elapsed >= Duration::from_millis(40));
         assert!(elapsed < Duration::from_millis(500));
+    }
+
+    /// Five recv arms plus a default: exercises the macro with many arms.
+    #[test]
+    fn five_recv_arms_with_default() {
+        let (_tx1, rx1) = unbounded_mpmc::channel::<i32>();
+        let (_tx2, rx2) = unbounded_mpmc::channel::<i32>();
+        let (_tx3, rx3) = bounded_mpmc::channel::<i32>(4);
+        let (_tx4, rx4) = bounded_mpsc::channel::<i32>(4);
+        let (tx5, rx5) = unbounded_mpsc::channel::<i32>();
+
+        tx5.send(55).unwrap();
+
+        let mut _fired = false;
+        select! {
+            recv(rx1) -> _ => panic!("rx1 must not fire"),
+            recv(rx2) -> _ => panic!("rx2 must not fire"),
+            recv(rx3) -> _ => panic!("rx3 must not fire"),
+            recv(rx4) -> _ => panic!("rx4 must not fire"),
+            recv(rx5) -> msg => { assert_eq!(msg.unwrap(), 55); _fired = true; },
+            default => panic!("default must not fire when rx5 is ready"),
+        }
+        assert!(_fired);
+    }
+
+    /// Mixed recv + send in a blocking select.
+    #[test]
+    fn mixed_recv_send_blocking_many_arms() {
+        let (tx_send, rx_send) = bounded_mpmc::channel::<i32>(4);
+        let (tx_recv, rx_recv) = unbounded_mpmc::channel::<i32>();
+
+        // Make recv arm ready; send arm also ready (space in buffer).
+        tx_recv.send(99).unwrap();
+
+        select! {
+            send(tx_send, 2) -> res => {
+                assert!(res.is_ok());
+                // The send completed; value should be in the channel.
+                assert_eq!(rx_send.try_recv().unwrap(), 2);
+            },
+            recv(rx_recv) -> msg => {
+                assert_eq!(msg.unwrap(), 99);
+            },
+        }
     }
 }

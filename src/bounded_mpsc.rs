@@ -28,7 +28,9 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
+//! use selectables::bounded_mpsc;
+//!
 //! let (tx, rx) = bounded_mpsc::channel(16);
 //!
 //! // Multiple senders

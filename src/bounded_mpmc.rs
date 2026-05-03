@@ -28,7 +28,9 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
+//! use selectables::bounded_mpmc;
+//!
 //! let (tx, rx) = bounded_mpmc::channel(10);
 //!
 //! // Multiple senders
@@ -533,5 +535,16 @@ mod tests {
         // Disconnected state counts as ready for recv arms.
         assert!(rx.is_ready());
         assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn sender_is_closed() {
+        let (tx, rx) = channel::<i32>(4);
+        assert!(!tx.is_closed());
+        let rx2 = rx.clone();
+        drop(rx);
+        assert!(!tx.is_closed()); // rx2 still alive
+        drop(rx2);
+        assert!(tx.is_closed());
     }
 }

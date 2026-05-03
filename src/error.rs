@@ -115,9 +115,9 @@ impl std::error::Error for TryRecvError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendError<T>(pub T);
 
-impl<T: std::fmt::Debug> std::fmt::Display for SendError<T> {
+impl<T> std::fmt::Display for SendError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "send on a disconnected channel: {:?}", self.0)
+        f.write_str("send on a disconnected channel")
     }
 }
 
@@ -155,7 +155,15 @@ mod tests {
     #[test]
     fn send_error_display() {
         let err = SendError(42i32);
-        assert_eq!(err.to_string(), "send on a disconnected channel: 42");
+        assert_eq!(err.to_string(), "send on a disconnected channel");
+    }
+
+    #[test]
+    fn send_error_display_no_debug_required() {
+        // SendError<T> implements Display even when T does not implement Debug.
+        struct NoDebug;
+        let err = SendError(NoDebug);
+        assert_eq!(err.to_string(), "send on a disconnected channel");
     }
 
     #[test]

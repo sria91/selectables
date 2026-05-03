@@ -560,4 +560,15 @@ mod tests {
         }
         assert_eq!(received.load(Relaxed) as u32, TOTAL);
     }
+
+    #[test]
+    fn sender_is_closed() {
+        let (tx, rx) = channel::<i32>();
+        assert!(!tx.is_closed());
+        let rx2 = rx.clone();
+        drop(rx);
+        assert!(!tx.is_closed()); // rx2 still alive
+        drop(rx2);
+        assert!(tx.is_closed());
+    }
 }

@@ -28,7 +28,10 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
+//! use std::time::Duration;
+//! use selectables::{oneshot, RecvError};
+//!
 //! let (tx, rx) = oneshot::channel();
 //!
 //! std::thread::spawn(move || {
@@ -40,6 +43,7 @@
 //! match rx.recv() {
 //!     Ok(msg) => println!("Got: {}", msg),
 //!     Err(RecvError::Disconnected) => println!("Sender dropped without sending"),
+//!     Err(_) => unreachable!("oneshot channels do not produce other errors"),
 //! }
 //! ```
 //!

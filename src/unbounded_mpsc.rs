@@ -28,7 +28,9 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
+//! use selectables::unbounded_mpsc;
+//!
 //! let (tx, rx) = unbounded_mpsc::channel();
 //!
 //! // Many senders

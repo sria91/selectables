@@ -10,12 +10,17 @@ use std::{
 // ════════════════════════════════════════════════════════════════════════════
 //
 // Note on structural duplication: bounded_mpmc, bounded_mpsc, unbounded_mpmc,
-// and unbounded_mpsc all share nearly identical `Chan` / `Sender` / `Receiver`
-// scaffolding.  They differ only in the backing queue type (LockFreeBoundedRing
-// vs crossbeam_queue::SegQueue), whether Sender is Clone (MPMC/MPSC), and
-// wake semantics (both-side vs recv-only wakeup).  A future macro or generic
-// abstraction could collapse them, but the duplication is currently kept
-// explicit for readability and to avoid coupling unrelated channel types.
+// and unbounded_mpsc share ~80% identical `Chan` / `Sender` / `Receiver`
+// scaffolding.  They differ in:
+//   1. Backing queue: LockFreeBoundedRing (bounded) vs SegQueue (unbounded)
+//   2. Wake-on-send: wake_one (MPMC) vs wake_all_unselected (MPSC)
+//   3. Bounded channels carry send_select_waiters; unbounded do not
+//   4. Bounded SelectableSender::is_ready checks !ring.is_full(); unbounded always true
+//
+// These differences are interspersed throughout method bodies, making a generic
+// or macro-based consolidation complex with diminishing readability returns.
+// The duplication is kept explicit so each channel flavour can be understood
+// in isolation.  When modifying shared logic, grep across all four modules.
 
 /// Shared lock-free bounded ring buffer used by bounded MPMC/MPSC channels.
 ///
